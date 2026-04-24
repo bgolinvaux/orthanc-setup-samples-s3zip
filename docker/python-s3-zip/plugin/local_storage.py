@@ -1,5 +1,7 @@
+import logging
 import os
 import orthanc
+import sys
 import threading
 import subprocess
 import queue
@@ -10,6 +12,54 @@ from collections import deque
 from s3zip_logging import get_logger
 
 logger = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Per-module log-level override for eviction / disk-space monitoring.
+#
+# S3ZIP_LOCAL_STORAGE_LOG_LEVEL overrides the level for the s3zip.local_storage
+# logger only, without affecting any other s3zip.* module.  This makes it easy
+# to enable verbose eviction tracing in CI without flooding the logs with
+# debug output from upload/download/read paths.
+#
+# Accepted values: DEBUG, INFO, WARNING, ERROR (case-insensitive).
+# If unset, the level is inherited from the parent s3zip logger
+# (controlled by S3ZIP_LOG_LEVEL, default INFO).
+#
+# Example (CI compose file):
+#   S3ZIP_LOCAL_STORAGE_LOG_LEVEL: DEBUG
+# ---------------------------------------------------------------------------
+_LOCAL_STORAGE_LOG_LEVEL_ENV_VAR = "S3ZIP_LOCAL_STORAGE_LOG_LEVEL"
+_module_level_override = os.environ.get(_LOCAL_STORAGE_LOG_LEVEL_ENV_VAR)
+if _module_level_override:
+    _lvl = getattr(logging, _module_level_override.upper(), None)
+    if _lvl is not None:
+        # Set the level on this module's logger so isEnabledFor() returns True for
+        # records at the override level.
+        logger.setLevel(_lvl)
+        # Also lower the level on any handler attached directly to the s3zip root logger
+        # (the one installed by _ensure_s3zip_logging before inject_logger_factory is
+        # called).  Without this, Python's callHandlers() would filter the record at the
+        # handler even though the originating logger accepted it — the handler-level check
+        # is independent of the logger-level check and is the one that matters during
+        # propagation.  After inject_logger_factory() the s3zip root handler is removed
+        # and replaced by the root-logger handler (level=NOTSET=0), so this adjustment is
+        # only relevant during the import-time window and in standalone setups that never
+        # call inject_logger_factory().
+        _s3zip_root = logging.getLogger("s3zip")
+        for _h in _s3zip_root.handlers:
+            if _lvl < _h.level:
+                _h.setLevel(_lvl)
+        print(
+            f"[s3zip] local_storage: log level overridden by "
+            f"{_LOCAL_STORAGE_LOG_LEVEL_ENV_VAR}={_module_level_override.upper()}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[s3zip] local_storage: ignoring invalid "
+            f"{_LOCAL_STORAGE_LOG_LEVEL_ENV_VAR}={_module_level_override!r}",
+            file=sys.stderr,
+        )
 
 
 class LocalStorage(LocalStorageInterface):
@@ -39,7 +89,7 @@ class LocalStorage(LocalStorageInterface):
     def set_eviction_guard(self, is_folder_safe_to_evict: callable):
         """
         - Set a callback that determines if a local series folder is safe to evict.
-        - The callback receives the folder name (not the full path) and 
+        - The callback receives the folder name (not the full path) and
           must return True if the folder's data has been safely backed up to S3.
         - If this callback is not set, all folders are considered safe to evict.
         """
@@ -47,6 +97,7 @@ class LocalStorage(LocalStorageInterface):
 
     def _update_local_storage_stats(self):
         with self._lock:
+            prev_available = getattr(self, '_available_size', None)
             self._available_size = self._max_size
             self._block_size = os.statvfs(self._root).f_frsize
 
@@ -56,6 +107,8 @@ class LocalStorage(LocalStorageInterface):
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             lines = result.stdout.strip().split("\n")
 
+            total_folders = 0
+            total_apparent_bytes = 0
             for line in lines:
                 size_str, path = line.split("\t")
                 folder_size = int(size_str)
@@ -63,17 +116,57 @@ class LocalStorage(LocalStorageInterface):
                     last_modified = os.path.getmtime(path)
                     self._available_size -= folder_size
                     self._folder_stats.put((last_modified, path, folder_size))
+                    total_folders += 1
+                    total_apparent_bytes += folder_size
+
+            logger.debug(
+                "LocalStorage: disk stats refreshed",
+                max_size_mb=self._max_size // (1024 * 1024),
+                max_size_bytes=self._max_size,
+                block_size=self._block_size,
+                total_folders=total_folders,
+                total_apparent_bytes=total_apparent_bytes,
+                total_apparent_mb=round(total_apparent_bytes / (1024 * 1024), 2),
+                available_bytes=self._available_size,
+                available_mb=round(self._available_size / (1024 * 1024), 2),
+                prev_available_bytes=prev_available,
+            )
 
 
     def _make_room(self, size: int):
         with self._lock:
             estimated_disk_size = ((size + self._block_size - 1) // self._block_size) * self._block_size
 
+            logger.debug(
+                "LocalStorage: _make_room called",
+                requested_bytes=size,
+                estimated_disk_bytes=estimated_disk_size,
+                current_available_bytes=self._available_size,
+                current_available_mb=round(self._available_size / (1024 * 1024), 2),
+            )
+
             if estimated_disk_size < self._available_size:
                 self._available_size -= estimated_disk_size
+                logger.debug(
+                    "LocalStorage: fast path - sufficient space, no eviction needed",
+                    available_after_bytes=self._available_size,
+                    available_after_mb=round(self._available_size / (1024 * 1024), 2),
+                )
                 return
 
+            logger.debug(
+                "LocalStorage: slow path - available space insufficient, refreshing disk stats",
+                estimated_disk_bytes=estimated_disk_size,
+                available_before_refresh_bytes=self._available_size,
+            )
             self._update_local_storage_stats()
+
+            logger.debug(
+                "LocalStorage: disk stats refreshed, starting eviction loop",
+                estimated_disk_bytes=estimated_disk_size,
+                available_after_refresh_bytes=self._available_size,
+                folders_queued=self._folder_stats.qsize(),
+            )
 
             # Reclaim space -- evict oldest folders first, but protect folders
             # whose data has not yet been safely backed up to S3.
@@ -81,6 +174,8 @@ class LocalStorage(LocalStorageInterface):
             # exceed the local storage capacity, but the S3 upload process is
             # still catching up
             skipped = []
+            freed_bytes = 0
+            freed_folders = 0
             while estimated_disk_size > self._available_size and not self._folder_stats.empty():
                 entry = self._folder_stats.get()
                 _, path, folder_size = entry
@@ -103,16 +198,41 @@ class LocalStorage(LocalStorageInterface):
                         continue
 
                 orthanc.LogInfo(f"LocalStorage: reclaiming space by deleting local folder '{path}'")
+                logger.debug(
+                    "LocalStorage: evicting folder",
+                    folder=folder_name,
+                    folder_size=folder_size,
+                    available_before=self._available_size,
+                )
 
                 # TODO: handle errors here (e.g. if the file gets locked by
                 # another process, or if it is being deleted by someone trying
                 # to help! Unlikely but what can go wrong will go wrong...)
                 shutil.rmtree(path)
                 self._available_size += folder_size
+                freed_bytes += folder_size
+                freed_folders += 1
+
+                logger.debug(
+                    "LocalStorage: folder evicted",
+                    folder=folder_name,
+                    folder_size=folder_size,
+                    available_after=self._available_size,
+                )
 
             # put skipped entries back
             for entry in skipped:
                 self._folder_stats.put(entry)
+
+            logger.debug(
+                "LocalStorage: eviction loop complete",
+                freed_folders=freed_folders,
+                freed_bytes=freed_bytes,
+                skipped_folders=len(skipped),
+                estimated_disk_size=estimated_disk_size,
+                available_after_eviction_bytes=self._available_size,
+                available_after_eviction_mb=round(self._available_size / (1024 * 1024), 2),
+            )
 
             if estimated_disk_size > self._available_size:
                 logger.warning(
@@ -120,7 +240,10 @@ class LocalStorage(LocalStorageInterface):
                     "Some folders are protected because they are not yet on S3.",
                     needed=estimated_disk_size,
                     available=self._available_size,
-                    protected_folders=len(skipped))
+                    available_mb=round(self._available_size / (1024 * 1024), 2),
+                    protected_folders=len(skipped),
+                    max_size_mb=self._max_size // (1024 * 1024),
+                )
 
 
     def write_file(self, local_series_folder: str, uuid: str, content: bytes):
