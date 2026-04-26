@@ -49,6 +49,25 @@ class S3ZipStorage:
 
         logger.debug("S3ZipStorage initialized")
 
+    def evict_local_cache(self) -> dict:
+        """Force-evict every locally-cached series already on S3.
+
+        Returns a JSON-friendly dict (folders evicted, bytes freed, folders
+        skipped because not yet uploaded, available bytes after, max bytes).
+        """
+        result = self._local_storage.evict_all_safe()
+        return {
+            "freed_folders": result.freed_folders,
+            "freed_bytes": result.freed_bytes,
+            "skipped_folders": result.skipped_folders,
+            "available_bytes": result.available_bytes_after,
+            "max_bytes": self._local_storage._max_size,
+        }
+
+    def get_local_cache_stats(self) -> dict:
+        """Return a snapshot of local-cache occupancy without triggering eviction."""
+        return self._local_storage.get_cache_summary()
+
     def start(self):
         logger.debug("cleaning uncommitted series")
         self._uncommitted_series_handler.on_orthanc_started()

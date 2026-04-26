@@ -174,6 +174,42 @@ def on_rest_api_series_s3_archive(output, uri, **request): # GET -> streams a zi
         output.SendMethodNotAllowed('GET')
 
 
+def on_rest_api_local_cache_stats(output, uri, **request):
+    """GET /s3-zip/local-cache/stats -- returns local-cache occupancy snapshot.
+
+    Diagnostic endpoint. Refreshes disk stats but does NOT trigger eviction.
+    """
+    global storage_singleton
+
+    if request['method'] == 'GET':
+        if not storage_singleton:
+            output.SendHttpStatusCode(503)
+            return
+        stats = storage_singleton.get_local_cache_stats()
+        output.AnswerBuffer(json.dumps(stats), 'application/json')
+    else:
+        output.SendMethodNotAllowed('GET')
+
+
+def on_rest_api_local_cache_evict_all(output, uri, **request):
+    """POST /s3-zip/local-cache/evict-all -- force eviction of every series already on S3.
+
+    Admin endpoint used by tests and the interactive health page to simulate a
+    cold local cache. Synchronous: returns once the eviction pass is done.
+    Folders without a ``.s3-uploaded`` marker are protected.
+    """
+    global storage_singleton
+
+    if request['method'] == 'POST':
+        if not storage_singleton:
+            output.SendHttpStatusCode(503)
+            return
+        result = storage_singleton.evict_local_cache()
+        output.AnswerBuffer(json.dumps(result), 'application/json')
+    else:
+        output.SendMethodNotAllowed('POST')
+
+
 def on_rest_api_series_s3_copy_to_s3(output, uri, **request):  # POST, no payload, answer = {} -> schedules a copy to s3 (asynchronous)
     global storage_singleton
 
@@ -329,6 +365,8 @@ def register_s3_zip_storage_plugin():
     orthanc.RegisterRestCallback('/series/(.*)/s3-zip/status', on_rest_api_series_s3_status)
     orthanc.RegisterRestCallback('/series/(.*)/s3-zip/copy-to-s3', on_rest_api_series_s3_copy_to_s3)
     orthanc.RegisterRestCallback('/series/(.*)/archive', on_rest_api_series_s3_archive)
+    orthanc.RegisterRestCallback('/s3-zip/local-cache/stats', on_rest_api_local_cache_stats)
+    orthanc.RegisterRestCallback('/s3-zip/local-cache/evict-all', on_rest_api_local_cache_evict_all)
     logger.debug("registering new REST Api routes - done")
 
 

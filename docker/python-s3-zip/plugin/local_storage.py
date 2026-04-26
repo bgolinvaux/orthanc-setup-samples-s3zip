@@ -6,10 +6,25 @@ import threading
 import subprocess
 import queue
 import shutil
+from dataclasses import dataclass
 from typing import Callable, Tuple, Optional
 from local_storage_interface import LocalStorageInterface
 from collections import deque
 from s3zip_logging import get_logger
+
+
+@dataclass
+class EvictionResult:
+    """Outcome of an eviction pass.
+
+    Returned both by the make-room slow path and by the explicit
+    ``evict_all_safe`` admin entry point so callers (REST endpoint, CI tests,
+    health page) can render uniform stats.
+    """
+    freed_folders: int
+    freed_bytes: int
+    skipped_folders: int
+    available_bytes_after: int
 
 logger = get_logger(__name__)
 
@@ -133,6 +148,89 @@ class LocalStorage(LocalStorageInterface):
             )
 
 
+    def _evict_until(self, target_available_bytes: Optional[int]) -> EvictionResult:
+        """Evict oldest-first folders until ``self._available_size`` reaches the target.
+
+        Caller MUST hold ``self._lock`` and MUST have refreshed
+        ``self._folder_stats`` (e.g. via ``_update_local_storage_stats``)
+        before calling: this method neither acquires the lock nor refreshes
+        the queue.
+
+        Args:
+            target_available_bytes: stop the loop as soon as
+                ``self._available_size >= target_available_bytes``. Pass
+                ``None`` to drain the LRU queue completely (i.e. evict
+                everything that the eviction guard considers safe to evict).
+
+        Folders without a ``.s3-uploaded`` marker are protected by the
+        eviction guard set via ``set_eviction_guard`` and are skipped, then
+        put back into the queue at the end so they remain candidates for
+        future eviction.
+        """
+        skipped = []
+        freed_bytes = 0
+        freed_folders = 0
+
+        def _need_more() -> bool:
+            if target_available_bytes is None:
+                return True
+            return self._available_size < target_available_bytes
+
+        while _need_more() and not self._folder_stats.empty():
+            entry = self._folder_stats.get()
+            _, path, folder_size = entry
+
+            folder_name = os.path.basename(path)
+
+            if self._is_folder_safe_to_evict is not None:
+                try:
+                    safe = self._is_folder_safe_to_evict(folder_name)
+                except Exception as e:
+                    logger.warning("eviction guard check failed, skipping folder",
+                                   folder=folder_name, error=str(e))
+                    safe = False
+
+                if not safe:
+                    logger.info(
+                        "LocalStorage: skipping eviction of folder not yet on S3",
+                        folder=folder_name, folder_size=folder_size)
+                    skipped.append(entry)
+                    continue
+
+            orthanc.LogInfo(f"LocalStorage: reclaiming space by deleting local folder '{path}'")
+            logger.debug(
+                "LocalStorage: evicting folder",
+                folder=folder_name,
+                folder_size=folder_size,
+                available_before=self._available_size,
+            )
+
+            # TODO: handle errors here (e.g. if the file gets locked by
+            # another process, or if it is being deleted by someone trying
+            # to help! Unlikely but what can go wrong will go wrong...)
+            shutil.rmtree(path)
+            self._available_size += folder_size
+            freed_bytes += folder_size
+            freed_folders += 1
+
+            logger.debug(
+                "LocalStorage: folder evicted",
+                folder=folder_name,
+                folder_size=folder_size,
+                available_after=self._available_size,
+            )
+
+        # put skipped entries back
+        for entry in skipped:
+            self._folder_stats.put(entry)
+
+        return EvictionResult(
+            freed_folders=freed_folders,
+            freed_bytes=freed_bytes,
+            skipped_folders=len(skipped),
+            available_bytes_after=self._available_size,
+        )
+
     def _make_room(self, size: int):
         with self._lock:
             estimated_disk_size = ((size + self._block_size - 1) // self._block_size) * self._block_size
@@ -173,62 +271,13 @@ class LocalStorage(LocalStorageInterface):
             # This can be useful if the plugin receives a burst of uploads that
             # exceed the local storage capacity, but the S3 upload process is
             # still catching up
-            skipped = []
-            freed_bytes = 0
-            freed_folders = 0
-            while estimated_disk_size > self._available_size and not self._folder_stats.empty():
-                entry = self._folder_stats.get()
-                _, path, folder_size = entry
-
-                folder_name = os.path.basename(path)
-
-                if self._is_folder_safe_to_evict is not None:
-                    try:
-                        safe = self._is_folder_safe_to_evict(folder_name)
-                    except Exception as e:
-                        logger.warning("eviction guard check failed, skipping folder",
-                                       folder=folder_name, error=str(e))
-                        safe = False
-
-                    if not safe:
-                        logger.info(
-                            "LocalStorage: skipping eviction of folder not yet on S3",
-                            folder=folder_name, folder_size=folder_size)
-                        skipped.append(entry)
-                        continue
-
-                orthanc.LogInfo(f"LocalStorage: reclaiming space by deleting local folder '{path}'")
-                logger.debug(
-                    "LocalStorage: evicting folder",
-                    folder=folder_name,
-                    folder_size=folder_size,
-                    available_before=self._available_size,
-                )
-
-                # TODO: handle errors here (e.g. if the file gets locked by
-                # another process, or if it is being deleted by someone trying
-                # to help! Unlikely but what can go wrong will go wrong...)
-                shutil.rmtree(path)
-                self._available_size += folder_size
-                freed_bytes += folder_size
-                freed_folders += 1
-
-                logger.debug(
-                    "LocalStorage: folder evicted",
-                    folder=folder_name,
-                    folder_size=folder_size,
-                    available_after=self._available_size,
-                )
-
-            # put skipped entries back
-            for entry in skipped:
-                self._folder_stats.put(entry)
+            result = self._evict_until(target_available_bytes=estimated_disk_size)
 
             logger.debug(
                 "LocalStorage: eviction loop complete",
-                freed_folders=freed_folders,
-                freed_bytes=freed_bytes,
-                skipped_folders=len(skipped),
+                freed_folders=result.freed_folders,
+                freed_bytes=result.freed_bytes,
+                skipped_folders=result.skipped_folders,
                 estimated_disk_size=estimated_disk_size,
                 available_after_eviction_bytes=self._available_size,
                 available_after_eviction_mb=round(self._available_size / (1024 * 1024), 2),
@@ -241,9 +290,73 @@ class LocalStorage(LocalStorageInterface):
                     needed=estimated_disk_size,
                     available=self._available_size,
                     available_mb=round(self._available_size / (1024 * 1024), 2),
-                    protected_folders=len(skipped),
+                    protected_folders=result.skipped_folders,
                     max_size_mb=self._max_size // (1024 * 1024),
                 )
+
+    def evict_all_safe(self) -> EvictionResult:
+        """Force-evict every locally-cached series that has been safely uploaded to S3.
+
+        Admin/diagnostic entry point. Refreshes the LRU queue from disk, then
+        drains it: every folder whose eviction guard returns True
+        (``.s3-uploaded`` marker present) is removed from the local cache;
+        folders still in flight are skipped and remain on disk.
+
+        Synchronous: holds ``self._lock`` for the entire pass, so concurrent
+        ``write_file`` / ``read_file`` calls are serialised behind it. The
+        cost is O(num_local_folders) ``shutil.rmtree`` calls plus one
+        ``du -b --max-depth=1`` invocation.
+
+        Returns an ``EvictionResult`` describing what was freed.
+        """
+        with self._lock:
+            self._update_local_storage_stats()
+            result = self._evict_until(target_available_bytes=None)
+
+            logger.info(
+                "LocalStorage: evict_all_safe complete",
+                freed_folders=result.freed_folders,
+                freed_bytes=result.freed_bytes,
+                skipped_folders=result.skipped_folders,
+                available_after_bytes=self._available_size,
+                available_after_mb=round(self._available_size / (1024 * 1024), 2),
+            )
+            return result
+
+    def get_cache_summary(self, marker_filename: str = ".s3-uploaded") -> dict:
+        """Return a snapshot of local-cache occupancy.
+
+        Refreshes the disk stats (does NOT evict) and walks the temp folder
+        once to count how many series are already on S3 (i.e. have the
+        ``marker_filename`` sentinel) versus still in flight.
+
+        The counts are advisory — they are racy with the upload thread.
+        """
+        with self._lock:
+            self._update_local_storage_stats()
+            total_folders = self._folder_stats.qsize()
+            uploaded = 0
+            pending = 0
+            try:
+                for name in os.listdir(self._root):
+                    folder = os.path.join(self._root, name)
+                    if not os.path.isdir(folder):
+                        continue
+                    if os.path.exists(os.path.join(folder, marker_filename)):
+                        uploaded += 1
+                    else:
+                        pending += 1
+            except FileNotFoundError:
+                pass
+            used_bytes = self._max_size - self._available_size
+            return {
+                "max_bytes": self._max_size,
+                "available_bytes": self._available_size,
+                "used_bytes": used_bytes,
+                "total_folders": total_folders,
+                "folders_on_s3": uploaded,
+                "folders_not_on_s3": pending,
+            }
 
 
     def write_file(self, local_series_folder: str, uuid: str, content: bytes):
