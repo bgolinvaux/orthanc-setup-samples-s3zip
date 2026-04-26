@@ -190,17 +190,17 @@ class S3ZipStorage:
                         local_series_folder=cd.local_series_folder)
                     return orthanc.ErrorCode.UNKNOWN_RESOURCE, None
 
-            logger.info("instance not in local cache, retrieving series from S3",
-                        uuid=uuid,
-                        s3_zip_key=s3_zip_key,
-                        local_series_folder=cd.local_series_folder)
+            logger.debug("instance not in local cache, retrieving series from S3",
+                         uuid=uuid,
+                         s3_zip_key=s3_zip_key,
+                         local_series_folder=cd.local_series_folder)
             logger.debug("calling zip_manager.retrieve_zip_from_s3()", uuid=uuid, s3_zip_key=s3_zip_key)
             self._zip_manager.retrieve_zip_from_s3(s3_zip_key=s3_zip_key,
                                                    local_series_folder=cd.local_series_folder)
             logger.debug("zip_manager.retrieve_zip_from_s3() returned", uuid=uuid)
-            logger.info("series retrieved from S3 into local cache",
-                        uuid=uuid,
-                        s3_zip_key=s3_zip_key)
+            logger.debug("series retrieved from S3 into local cache",
+                         uuid=uuid,
+                         s3_zip_key=s3_zip_key)
         else:
             logger.debug("instance found in local cache",
                          uuid=uuid,
