@@ -49,6 +49,25 @@ class S3ZipStorage:
 
         logger.debug("S3ZipStorage initialized")
 
+    def evict_local_cache(self) -> dict:
+        """Force-evict every locally-cached series already on S3.
+
+        Returns a JSON-friendly dict (folders evicted, bytes freed, folders
+        skipped because not yet uploaded, available bytes after, max bytes).
+        """
+        result = self._local_storage.evict_all_safe()
+        return {
+            "freed_folders": result.freed_folders,
+            "freed_bytes": result.freed_bytes,
+            "skipped_folders": result.skipped_folders,
+            "available_bytes": result.available_bytes_after,
+            "max_bytes": self._local_storage._max_size,
+        }
+
+    def get_local_cache_stats(self) -> dict:
+        """Return a snapshot of local-cache occupancy without triggering eviction."""
+        return self._local_storage.get_cache_summary()
+
     def start(self):
         logger.debug("cleaning uncommitted series")
         self._uncommitted_series_handler.on_orthanc_started()
@@ -171,17 +190,17 @@ class S3ZipStorage:
                         local_series_folder=cd.local_series_folder)
                     return orthanc.ErrorCode.UNKNOWN_RESOURCE, None
 
-            logger.info("instance not in local cache, retrieving series from S3",
-                        uuid=uuid,
-                        s3_zip_key=s3_zip_key,
-                        local_series_folder=cd.local_series_folder)
+            logger.debug("instance not in local cache, retrieving series from S3",
+                         uuid=uuid,
+                         s3_zip_key=s3_zip_key,
+                         local_series_folder=cd.local_series_folder)
             logger.debug("calling zip_manager.retrieve_zip_from_s3()", uuid=uuid, s3_zip_key=s3_zip_key)
             self._zip_manager.retrieve_zip_from_s3(s3_zip_key=s3_zip_key,
                                                    local_series_folder=cd.local_series_folder)
             logger.debug("zip_manager.retrieve_zip_from_s3() returned", uuid=uuid)
-            logger.info("series retrieved from S3 into local cache",
-                        uuid=uuid,
-                        s3_zip_key=s3_zip_key)
+            logger.debug("series retrieved from S3 into local cache",
+                         uuid=uuid,
+                         s3_zip_key=s3_zip_key)
         else:
             logger.debug("instance found in local cache",
                          uuid=uuid,
