@@ -184,8 +184,17 @@ class LocalStorage(LocalStorageInterface):
             while self._scan_in_progress:
                 self._io_condition.wait()
             self._scan_in_progress = True
-            while self._active_writers > 0:
-                self._io_condition.wait()
+            # If wait() is interrupted (e.g. by a signal) after we have already
+            # claimed the scan slot, we must clear the flag and wake any other
+            # blocked threads. Otherwise _scan_in_progress stays True forever
+            # and every subsequent _enter_write / scan-pauser deadlocks.
+            try:
+                while self._active_writers > 0:
+                    self._io_condition.wait()
+            except BaseException:
+                self._scan_in_progress = False
+                self._io_condition.notify_all()
+                raise
 
     def _resume_writes_after_scan(self) -> None:
         with self._io_condition:
@@ -733,10 +742,14 @@ class LocalStorage(LocalStorageInterface):
                                         local_series_folder=local_series_folder,
                                         content_type=content_type)
 
-        existed: bool = os.path.exists(path)
-
-        if existed:
+        # os.path.exists() + os.remove() is not atomic: eviction can rmtree
+        # the parent folder between the two calls. Catch FileNotFoundError
+        # rather than letting it surface as a storage callback error.
+        try:
             os.remove(path)
+            existed: bool = True
+        except FileNotFoundError:
+            existed = False
 
         logger.debug("remove called",
                      uuid=uuid,

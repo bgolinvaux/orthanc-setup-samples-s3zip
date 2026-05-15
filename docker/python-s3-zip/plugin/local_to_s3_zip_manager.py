@@ -380,16 +380,41 @@ class LocalToS3ZipManager:
                             s3_key=s3_key,
                             metadata_update_ms=int((t_meta_done - t_meta_start) * 1000))
 
+                # Re-check the attachment set: if a new instance landed for
+                # this series after the initial snapshot, the uploaded zip is
+                # already incomplete. Skip the marker so eviction cannot purge
+                # the folder. The next stable-series event will trigger another
+                # copy that includes the new instance(s) and publishes a fresh
+                # marker.
+                current_attachments: list[str] = self._get_instances_attachments(series_id=series_id)
+                attachments_changed: bool = set(current_attachments) != set(attachments_uuids)
+
                 # The marker is the eviction guard's durable signal that the
                 # folder contents are recoverable from S3. It is written while
                 # the folder lease is active so eviction cannot remove the
                 # directory between opening the marker and atomically publishing
                 # its final path.
-                if local_series_folder:
+                if local_series_folder and not attachments_changed:
                     self._write_s3_uploaded_marker(
                         local_series_folder=local_series_folder,
                         s3_key=s3_key,
                         series_id=series_id,
+                    )
+                elif local_series_folder and attachments_changed:
+                    new_uuids = sorted(
+                        set(current_attachments) - set(attachments_uuids)
+                    )
+                    dropped_uuids = sorted(
+                        set(attachments_uuids) - set(current_attachments)
+                    )
+                    logger.warning(
+                        msg="attachment set changed during S3 copy; skipping marker write (next stable-series event will trigger a fresh copy)",
+                        series_id=series_id,
+                        s3_key=s3_key,
+                        snapshot_count=len(attachments_uuids),
+                        current_count=len(current_attachments),
+                        new_uuids=new_uuids,
+                        dropped_uuids=dropped_uuids,
                     )
 
         duration_ms = int((time.monotonic() - t0) * 1000)
@@ -441,6 +466,31 @@ class LocalToS3ZipManager:
                            series_id=series_id,
                            marker_path=marker_path,
                            error=str(e))
+
+    def invalidate_s3_uploaded_marker(self, local_series_folder: str) -> bool:
+        """Remove the ``.s3-uploaded`` marker for ``local_series_folder``.
+
+        Called on every storage_create for a series: any new instance landing
+        on disk invalidates the marker's invariant ("everything in this folder
+        is recoverable from S3"). Best effort -- a missing marker is the
+        expected steady state.
+        """
+        folder_path = self._local_storage.get_folder_path(local_series_folder)
+        marker_path = os.path.join(folder_path, ".s3-uploaded")
+        try:
+            os.remove(marker_path)
+            logger.debug("invalidated S3 upload marker",
+                         local_series_folder=local_series_folder,
+                         marker_path=marker_path)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logger.warning("failed to invalidate S3 upload marker",
+                           local_series_folder=local_series_folder,
+                           marker_path=marker_path,
+                           error=str(e))
+            return False
 
     def _fsync_directory_if_supported(self, folder_path: str):
         if not hasattr(os, "O_DIRECTORY"):

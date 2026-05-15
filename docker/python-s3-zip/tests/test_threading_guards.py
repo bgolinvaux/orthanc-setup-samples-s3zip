@@ -67,6 +67,30 @@ def _fake_du_for(root: str, folder_name: str = "series", folder_size: int = 10):
     return fake_run
 
 
+def _fake_du_walk(root: str):
+    """Generic du substitute: walks ``root`` and sums real file sizes per child."""
+    def fake_run(cmd, capture_output, text, check):
+        lines = []
+        total = 0
+        if os.path.isdir(root):
+            for entry in os.listdir(root):
+                child = os.path.join(root, entry)
+                if not os.path.isdir(child):
+                    continue
+                size = 0
+                for dirpath, _dirnames, filenames in os.walk(child):
+                    for fname in filenames:
+                        try:
+                            size += os.path.getsize(os.path.join(dirpath, fname))
+                        except OSError:
+                            pass
+                lines.append(f"{size}\t{child}")
+                total += size
+        lines.append(f"{total}\t{root}")
+        return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(lines), stderr="")
+    return fake_run
+
+
 class FolderLeaseTests(unittest.TestCase):
     def test_leased_folder_is_skipped_by_eviction_then_evicted_after_release(self):
         with tempfile.TemporaryDirectory() as root:
@@ -128,6 +152,189 @@ class FolderLeaseTests(unittest.TestCase):
             self.assertEqual(result.freed_folders, 0)
             self.assertEqual(result.skipped_folders, 1)
             self.assertTrue(os.path.isdir(folder))
+
+    def test_pause_writes_for_scan_clears_flag_when_wait_is_interrupted(self):
+        # Regression: if `wait()` raises after `_scan_in_progress` is set, the
+        # flag must be cleared and waiters notified. Otherwise every future
+        # write/scan deadlocks at `_enter_write` / `_pause_writes_for_scan`.
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_for(root)):
+                storage = LocalStorage(root=root, max_size_mb=1)
+
+            # Make sure the active-writers wait loop is taken.
+            storage._active_writers = 1
+
+            with mock.patch.object(
+                storage._io_condition,
+                "wait",
+                side_effect=KeyboardInterrupt("simulated signal"),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    storage._pause_writes_for_scan()
+
+            self.assertFalse(storage._scan_in_progress)
+
+            # And a fresh scan can still acquire the slot afterwards.
+            storage._active_writers = 0
+            with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_for(root)):
+                storage._update_local_storage_stats()
+            self.assertFalse(storage._scan_in_progress)
+
+    def test_remove_swallows_filenotfound_race_with_eviction(self):
+        # Eviction can rmtree the parent folder between `os.path.exists` and
+        # `os.remove`. The remove path must absorb that race instead of letting
+        # FileNotFoundError leak back to Orthanc's storage callback.
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_for(root)):
+                storage = LocalStorage(root=root, max_size_mb=1)
+
+            with mock.patch("local_storage.os.remove", side_effect=FileNotFoundError("gone")):
+                # Must not raise.
+                storage.remove(
+                    uuid="instance",
+                    local_series_folder="series",
+                    content_type=orthanc_stub.ContentType.DICOM,
+                )
+
+
+class ConcurrentStressTests(unittest.TestCase):
+    """Best-effort multi-thread stress.
+
+    Spins up a real ``LocalStorage`` against a real temp directory and runs
+    writers, readers, removers and evictors against it concurrently. Each
+    worker uses the public storage API just like Orthanc would. The asserts
+    only check global invariants -- no exceptions surface, accounting
+    stays consistent, and no scan slot or write count is left dangling.
+    """
+
+    def test_writers_readers_evictor_keep_state_consistent(self):
+        import random
+
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_walk(root)):
+                # Generous budget so the fast path is usually taken, but small
+                # enough that some calls cross the slow path during the run.
+                storage = LocalStorage(root=root, max_size_mb=4)
+
+                # Treat every folder as safe to evict so eviction actually fires.
+                storage.set_eviction_guard(lambda folder_name: True)
+
+                folders = [f"series-{i}" for i in range(6)]
+                stop = threading.Event()
+                errors: list[BaseException] = []
+                errors_lock = threading.Lock()
+
+                def record(exc: BaseException) -> None:
+                    with errors_lock:
+                        errors.append(exc)
+
+                def writer(seed: int) -> None:
+                    rng = random.Random(seed)
+                    with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_walk(root)):
+                        for _ in range(60):
+                            if stop.is_set():
+                                return
+                            folder = rng.choice(folders)
+                            uuid = f"u-{rng.randint(0, 999)}-{seed}-{_}"
+                            content = os.urandom(rng.randint(64, 4096))
+                            try:
+                                storage.write_file(local_series_folder=folder, uuid=uuid, content=content)
+                            except Exception as e:
+                                record(e)
+                                return
+
+                def reader(seed: int) -> None:
+                    rng = random.Random(seed + 1000)
+                    for _ in range(80):
+                        if stop.is_set():
+                            return
+                        folder = rng.choice(folders)
+                        uuid = f"u-{rng.randint(0, 999)}-{seed}-{_}"
+                        try:
+                            with storage.lease_folder(folder):
+                                if storage.has_local_file(
+                                    uuid=uuid,
+                                    local_series_folder=folder,
+                                    content_type=orthanc_stub.ContentType.DICOM,
+                                ):
+                                    storage.read_file(uuid=uuid, local_series_folder=folder)
+                        except FileNotFoundError:
+                            # Acceptable: file was evicted/removed between
+                            # has_local_file and read; the lease only protects
+                            # the folder, not individual files post-eviction.
+                            pass
+                        except Exception as e:
+                            record(e)
+                            return
+
+                def remover(seed: int) -> None:
+                    rng = random.Random(seed + 2000)
+                    for _ in range(40):
+                        if stop.is_set():
+                            return
+                        folder = rng.choice(folders)
+                        uuid = f"u-{rng.randint(0, 999)}-{seed}-{_}"
+                        try:
+                            storage.remove(
+                                uuid=uuid,
+                                local_series_folder=folder,
+                                content_type=orthanc_stub.ContentType.DICOM,
+                            )
+                        except Exception as e:
+                            record(e)
+                            return
+
+                def evictor() -> None:
+                    with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_walk(root)):
+                        for _ in range(15):
+                            if stop.is_set():
+                                return
+                            try:
+                                storage.evict_all_safe()
+                            except Exception as e:
+                                record(e)
+                                return
+
+                threads: list[threading.Thread] = []
+                for i in range(4):
+                    threads.append(threading.Thread(target=writer, args=(i,)))
+                for i in range(4):
+                    threads.append(threading.Thread(target=reader, args=(i,)))
+                for i in range(2):
+                    threads.append(threading.Thread(target=remover, args=(i,)))
+                threads.append(threading.Thread(target=evictor))
+
+                for t in threads:
+                    t.start()
+
+                deadline = time.monotonic() + 8
+                for t in threads:
+                    remaining = max(0.1, deadline - time.monotonic())
+                    t.join(timeout=remaining)
+                stop.set()
+
+                for t in threads:
+                    if t.is_alive():
+                        self.fail(f"thread did not finish in time: {t.name}")
+
+                if errors:
+                    self.fail(f"workers raised: {[type(e).__name__ + ': ' + str(e) for e in errors]}")
+
+                # Drain any final state with one more refresh so accounting
+                # reflects what is actually on disk.
+                with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_walk(root)):
+                    storage._update_local_storage_stats()
+
+                # Global invariants after the storm.
+                self.assertEqual(storage._active_writers, 0)
+                self.assertFalse(storage._scan_in_progress)
+                self.assertEqual(storage._folder_lease_counts, {})
+                self.assertEqual(storage._reserved_bytes, 0)
+                # Available + apparent disk usage must equal max_size after
+                # a fresh rescan (no reservations leaked).
+                used_estimate = storage._max_size - storage._available_size
+                self.assertGreaterEqual(used_estimate, 0)
+                self.assertLessEqual(used_estimate, storage._max_size)
 
 
 class _ReadPathLocalStorage:
@@ -425,20 +632,23 @@ class _UncommittedHandler:
 
 
 class CopySeriesToS3Tests(unittest.TestCase):
+    def _make_manager(self, local_storage, s3_client=None, uncommitted_handler=None):
+        return LocalToS3ZipManager(
+            s3_client=s3_client or _UploadS3Client(),
+            bucket_name="bucket",
+            local_storage=local_storage,
+            enable_compression=False,
+            uncommitted_series_handler=uncommitted_handler or _UncommittedHandler(),
+            s3_retrieval_retry_base_delay_sec=0,
+            s3_retrieval_retry_max_delay_sec=0,
+        )
+
     def test_copy_series_to_s3_leases_source_folder_and_writes_marker_atomically(self):
         with tempfile.TemporaryDirectory() as root:
             local_storage = _CopyLocalStorage(root)
             s3_client = _UploadS3Client()
             uncommitted_handler = _UncommittedHandler()
-            manager = LocalToS3ZipManager(
-                s3_client=s3_client,
-                bucket_name="bucket",
-                local_storage=local_storage,
-                enable_compression=False,
-                uncommitted_series_handler=uncommitted_handler,
-                s3_retrieval_retry_base_delay_sec=0,
-                s3_retrieval_retry_max_delay_sec=0,
-            )
+            manager = self._make_manager(local_storage, s3_client, uncommitted_handler)
 
             custom_data = CustomData(
                 storage=CustomData.Storage.LOCAL,
@@ -465,6 +675,58 @@ class CopySeriesToS3Tests(unittest.TestCase):
             marker_path = os.path.join(root, "series", ".s3-uploaded")
             with open(marker_path, "r") as f:
                 self.assertEqual(f.read(), "orthanc-series.zip")
+
+    def test_copy_skips_marker_when_new_instance_arrives_during_copy(self):
+        # Recheck-before-marker: if a new attachment appears between the
+        # initial snapshot and the marker write, the uploaded zip is already
+        # incomplete and the marker must NOT be published. The next stable
+        # event will trigger a fresh copy that captures the new instance.
+        with tempfile.TemporaryDirectory() as root:
+            local_storage = _CopyLocalStorage(root)
+            uncommitted_handler = _UncommittedHandler()
+            manager = self._make_manager(local_storage, uncommitted_handler=uncommitted_handler)
+
+            custom_data = CustomData(
+                storage=CustomData.Storage.LOCAL,
+                local_series_folder="series",
+            )
+
+            # First call: initial snapshot. Second call (the recheck): a third
+            # attachment has appeared.
+            attachment_calls = [["a", "b"], ["a", "b", "c"]]
+
+            with mock.patch.object(manager, "_get_instances_attachments", side_effect=attachment_calls):
+                with mock.patch.object(CustomData, "from_orthanc_attachment", return_value=custom_data):
+                    manager.copy_series_to_s3("orthanc-series")
+
+            # Snapshot's instances were still uploaded + custom-data'd: the
+            # snapshot's own data is valid in S3. Only the marker is withheld.
+            self.assertEqual(local_storage.reads, [("a", "series"), ("b", "series")])
+            self.assertFalse(
+                os.path.exists(os.path.join(root, "series", ".s3-uploaded")),
+                "marker must not be written when attachment set changed during copy",
+            )
+            # We still commit -- the data we did upload is on S3 and the next
+            # stable-series event will re-fire copy_series_to_s3 to cover the
+            # new instance.
+            self.assertEqual(uncommitted_handler.committed, ["orthanc-series"])
+
+    def test_invalidate_s3_uploaded_marker_removes_existing_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            local_storage = _CopyLocalStorage(root)
+            manager = self._make_manager(local_storage)
+
+            folder = os.path.join(root, "series")
+            os.makedirs(folder)
+            marker_path = os.path.join(folder, ".s3-uploaded")
+            with open(marker_path, "w") as f:
+                _ = f.write("series.zip")
+
+            self.assertTrue(manager.invalidate_s3_uploaded_marker("series"))
+            self.assertFalse(os.path.exists(marker_path))
+
+            # Idempotent on missing marker.
+            self.assertFalse(manager.invalidate_s3_uploaded_marker("series"))
 
 
 if __name__ == "__main__":

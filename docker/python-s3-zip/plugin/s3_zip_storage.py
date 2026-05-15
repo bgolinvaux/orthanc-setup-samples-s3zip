@@ -141,6 +141,13 @@ class S3ZipStorage:
                                                 content=content)
         logger.debug("local_storage.create() returned", uuid=uuid, error_code=str(error_code))
 
+        # Any new file invalidates "everything in this folder is on S3". Wipe
+        # the marker so eviction cannot purge the folder before the next copy
+        # captures this instance. A racing concurrent copy that recheck-skips
+        # its own marker write keeps the invariant intact. Idempotent on a
+        # missing marker, so safe to call even when create() failed.
+        _ = self._zip_manager.invalidate_s3_uploaded_marker(series_hash)
+
         custom_data = CustomData(CustomData.Storage.LOCAL, local_series_folder=series_hash)
 
         logger.debug("storage_create completed",
