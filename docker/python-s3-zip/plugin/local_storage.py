@@ -313,10 +313,23 @@ class LocalStorage(LocalStorageInterface):
                 available_before=self._available_size,
             )
 
-            # TODO: handle errors here (e.g. if the file gets locked by
-            # another process, or if it is being deleted by someone trying
-            # to help! Unlikely but what can go wrong will go wrong...)
-            shutil.rmtree(path)
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                logger.info(
+                    "LocalStorage: folder already gone during eviction",
+                    folder=folder_name,
+                    folder_size=folder_size,
+                )
+            except OSError as e:
+                logger.warning(
+                    "LocalStorage: failed to evict folder, leaving it queued for a future pass",
+                    folder=folder_name,
+                    folder_size=folder_size,
+                    error=str(e),
+                )
+                skipped.append(entry)
+                continue
             self._available_size += folder_size
             freed_bytes += folder_size
             freed_folders += 1

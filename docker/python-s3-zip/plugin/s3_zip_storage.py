@@ -5,7 +5,13 @@ from helpers import Helpers
 from typing import Optional, Tuple
 from boto3 import client as S3Client
 from local_storage import LocalStorage
-from local_to_s3_zip_manager import LocalToS3ZipManager, SeriesS3Info
+from local_to_s3_zip_manager import (
+    DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
+    DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
+    DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
+    LocalToS3ZipManager,
+    SeriesS3Info,
+)
 from uncommitted_series_handler import UncommittedSeriesHandler
 from custom_data import CustomData
 from s3zip_logging import get_logger
@@ -19,13 +25,25 @@ class S3ZipStorage:
     _zip_manager: LocalToS3ZipManager
     _uncommitted_series_handler: UncommittedSeriesHandler
 
-    def __init__(self, temporary_folder_root: str, temp_folder_max_size_mb: int, s3_client: S3Client, bucket_name: str, enable_compression: bool, key_prefix: str = ""):
+    def __init__(self,
+                 temporary_folder_root: str,
+                 temp_folder_max_size_mb: int,
+                 s3_client: S3Client,
+                 bucket_name: str,
+                 enable_compression: bool,
+                 key_prefix: str = "",
+                 s3_retrieval_max_attempts: int = DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
+                 s3_retrieval_retry_base_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
+                 s3_retrieval_retry_max_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS):
         logger.debug("initializing S3ZipStorage",
                      temp_folder=temporary_folder_root,
                      max_size_mb=temp_folder_max_size_mb,
                      bucket=bucket_name,
                      compression=enable_compression,
-                     key_prefix=key_prefix or "<none>")
+                     key_prefix=key_prefix or "<none>",
+                     s3_retrieval_max_attempts=s3_retrieval_max_attempts,
+                     s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
+                     s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec)
 
         self._uncommitted_series_handler = UncommittedSeriesHandler()
 
@@ -37,7 +55,10 @@ class S3ZipStorage:
                                                 local_storage=self._local_storage,
                                                 enable_compression=enable_compression,
                                                 uncommitted_series_handler=self._uncommitted_series_handler,
-                                                key_prefix=key_prefix)
+                                                key_prefix=key_prefix,
+                                                s3_retrieval_max_attempts=s3_retrieval_max_attempts,
+                                                s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
+                                                s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec)
 
         # Set up the eviction guard: a folder is safe to evict only if it has the
         # .s3-uploaded marker file written by the copy thread after a successful S3 upload.
@@ -144,7 +165,7 @@ class S3ZipStorage:
                      range_start=range_start,
                      size=size)
 
-        cd = CustomData.from_binary(custom_data)
+        cd: CustomData = CustomData.from_binary(custom_data)
 
         logger.debug("storage_read_range called",
                      uuid=uuid,

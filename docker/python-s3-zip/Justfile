@@ -1,0 +1,15 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+_ensure-pytest:
+    uv run python -c "import pytest" 2>/dev/null || uv add --dev pytest
+
+# Run unit tests
+tests-unit: _ensure-pytest
+    uv run pytest tests/ --ignore=tests/test_scenario.py
+
+# Run integration tests (requires Docker + running services via docker-compose.yml)
+tests-integration:
+    uv run python tests/test_scenario.py
+
+# Run all tests
+tests-all: tests-unit tests-integration

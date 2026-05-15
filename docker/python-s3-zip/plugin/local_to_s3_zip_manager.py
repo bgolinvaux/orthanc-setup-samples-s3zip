@@ -2,9 +2,11 @@ import orthanc
 import json
 import zipfile
 import os
+import random
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from typing import List, Dict, Optional, Tuple
 from boto3 import client as S3Client
 from local_storage_interface import LocalStorageInterface
@@ -12,7 +14,57 @@ from uncommitted_series_handler import UncommittedSeriesHandler
 from custom_data import CustomData
 from s3zip_logging import get_logger
 
+try:
+    from botocore import exceptions as botocore_exceptions
+except ImportError:
+    botocore_exceptions = None
+
 logger = get_logger(__name__)
+
+DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS = 3
+DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS = 0.5
+DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS = 5.0
+
+_TRANSIENT_CLIENT_ERROR_CODES = {
+    "InternalError",
+    "InternalFailure",
+    "RequestTimeout",
+    "RequestTimeoutException",
+    "ServiceUnavailable",
+    "SlowDown",
+    "ThrottledException",
+    "Throttling",
+    "ThrottlingException",
+    "TooManyRequestsException",
+}
+
+_PERMANENT_CLIENT_ERROR_CODES = {
+    "AccessDenied",
+    "InvalidAccessKeyId",
+    "InvalidObjectState",
+    "NoSuchBucket",
+    "NoSuchKey",
+    "SignatureDoesNotMatch",
+}
+
+_TRANSIENT_HTTP_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+if botocore_exceptions is not None:
+    ClientError = getattr(botocore_exceptions, "ClientError", None)
+    _TRANSIENT_BOTOCORE_EXCEPTIONS = tuple(
+        getattr(botocore_exceptions, name)
+        for name in (
+            "ConnectionClosedError",
+            "ConnectTimeoutError",
+            "EndpointConnectionError",
+            "ProxyConnectionError",
+            "ReadTimeoutError",
+        )
+        if hasattr(botocore_exceptions, name)
+    )
+else:
+    ClientError = None
+    _TRANSIENT_BOTOCORE_EXCEPTIONS = ()
 
 
 class SeriesS3Info:
@@ -39,12 +91,14 @@ class LocalToS3ZipManager:
         _condition: threading.Condition
         _ref_count: int
         _downloaded: bool
+        _failed_exception: Optional[BaseException]
 
         def __init__(self, series_id: str):
             self.series_id = series_id
             self._condition = threading.Condition()
             self._ref_count = 0
             self._downloaded = False
+            self._failed_exception = None
             logger.debug("ZipRetrieval created", series_id=series_id)
 
         def __enter__(self):
@@ -70,17 +124,34 @@ class LocalToS3ZipManager:
         def downloaded(self):
             return self._downloaded
 
+        @property
+        def failed_exception(self):
+            return self._failed_exception
+
         def set_downloaded(self):
             logger.debug("ZipRetrieval set_downloaded, notifying waiters",
                          series_id=self.series_id)
             self._downloaded = True
             self._condition.notify_all()
 
+        def set_failed(self, exc: BaseException):
+            logger.debug("ZipRetrieval set_failed, notifying waiters",
+                         series_id=self.series_id,
+                         error_type=type(exc).__name__,
+                         error=str(exc))
+            self._failed_exception = exc
+            self._condition.notify_all()
+
+        def raise_if_failed(self):
+            if self._failed_exception is not None:
+                raise self._failed_exception
+
         def wait_downloaded(self):
             logger.debug("ZipRetrieval waiting for download to complete",
                          series_id=self.series_id)
-            while not self._downloaded:
+            while not self._downloaded and self._failed_exception is None:
                 self._condition.wait()
+            self.raise_if_failed()
             logger.debug("ZipRetrieval download wait completed",
                          series_id=self.series_id)
 
@@ -93,13 +164,28 @@ class LocalToS3ZipManager:
     _copy_thread: threading.Thread
     _threads_should_stop: bool
     _zip_compression: int
+    _s3_retrieval_max_attempts: int
+    _s3_retrieval_retry_base_delay_sec: float
+    _s3_retrieval_retry_max_delay_sec: float
 
-    def __init__(self, s3_client: S3Client, bucket_name: str, local_storage: LocalStorageInterface, enable_compression: bool, uncommitted_series_handler: UncommittedSeriesHandler, key_prefix: str = ""):
+    def __init__(self,
+                 s3_client: S3Client,
+                 bucket_name: str,
+                 local_storage: LocalStorageInterface,
+                 enable_compression: bool,
+                 uncommitted_series_handler: UncommittedSeriesHandler,
+                 key_prefix: str = "",
+                 s3_retrieval_max_attempts: int = DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
+                 s3_retrieval_retry_base_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
+                 s3_retrieval_retry_max_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS):
         self._s3_client = s3_client
         self._bucket_name = bucket_name
         self._local_storage = local_storage
         self._uncommitted_series_handler = uncommitted_series_handler
         self._key_prefix = key_prefix.strip('/')
+        self._s3_retrieval_max_attempts = max(1, int(s3_retrieval_max_attempts))
+        self._s3_retrieval_retry_base_delay_sec = max(0.0, float(s3_retrieval_retry_base_delay_sec))
+        self._s3_retrieval_retry_max_delay_sec = max(0.0, float(s3_retrieval_retry_max_delay_sec))
         if enable_compression:
             self._zip_compression = zipfile.ZIP_DEFLATED
         else:
@@ -113,7 +199,10 @@ class LocalToS3ZipManager:
         logger.debug("LocalToS3ZipManager initialized",
                      bucket=bucket_name,
                      compression=compression_name,
-                     key_prefix=self._key_prefix or "<none>")
+                     key_prefix=self._key_prefix or "<none>",
+                     s3_retrieval_max_attempts=self._s3_retrieval_max_attempts,
+                     s3_retrieval_retry_base_delay_sec=self._s3_retrieval_retry_base_delay_sec,
+                     s3_retrieval_retry_max_delay_sec=self._s3_retrieval_retry_max_delay_sec)
 
 
     def start(self):
@@ -202,110 +291,106 @@ class LocalToS3ZipManager:
                          tmp_path=tmp_zip.name,
                          attachment_count=len(attachments_uuids))
 
-            with zipfile.ZipFile(tmp_zip.name, "w", compression=self._zip_compression) as zipf:
-                for idx, a_uuid in enumerate(attachments_uuids):
-                    if not local_series_folder: # they all share the same folder
-                        local_series_folder = CustomData.from_orthanc_attachment(a_uuid).local_series_folder
-                        logger.debug("resolved local_series_folder from first attachment",
+            with ExitStack() as local_folder_lease:
+                with zipfile.ZipFile(tmp_zip.name, "w", compression=self._zip_compression) as zipf:
+                    for idx, a_uuid in enumerate(attachments_uuids):
+                        if not local_series_folder: # they all share the same folder
+                            local_series_folder = CustomData.from_orthanc_attachment(a_uuid).local_series_folder
+                            local_folder_lease.enter_context(self._local_storage.lease_folder(local_series_folder))
+                            logger.debug("resolved local_series_folder from first attachment",
+                                         series_id=series_id,
+                                         local_series_folder=local_series_folder)
+                        content = self._local_storage.read_file(uuid=a_uuid,
+                                                                local_series_folder=local_series_folder)
+                        total_uncompressed_bytes += len(content)
+                        logger.debug("adding attachment to zip",
                                      series_id=series_id,
-                                     local_series_folder=local_series_folder)
-                    content = self._local_storage.read_file(uuid=a_uuid,
-                                                            local_series_folder=local_series_folder)
-                    total_uncompressed_bytes += len(content)
-                    logger.debug("adding attachment to zip",
+                                     uuid=a_uuid,
+                                     index=idx,
+                                     size_bytes=len(content))
+                        zipf.writestr(a_uuid, content)
+                        logger.debug("attachment added to zip",
+                                     series_id=series_id,
+                                     uuid=a_uuid,
+                                     index=idx)
+
+                t_zip_done = time.monotonic()
+                zip_size_bytes = os.path.getsize(tmp_zip.name)
+
+                logger.info("zip archive built",
+                            series_id=series_id,
+                            attachment_count=len(attachments_uuids),
+                            zip_size_bytes=zip_size_bytes,
+                            uncompressed_bytes=total_uncompressed_bytes,
+                            zip_build_ms=int((t_zip_done - t0) * 1000))
+
+                # Upload to S3
+                s3_key = self._get_series_s3_key(series_id)
+                logger.info("uploading zip to S3",
+                            series_id=series_id,
+                            s3_key=s3_key,
+                            bucket=self._bucket_name,
+                            zip_size_bytes=zip_size_bytes,
+                            uncompressed_bytes=total_uncompressed_bytes)
+                logger.debug("calling s3_client.upload_file()",
+                             series_id=series_id,
+                             s3_key=s3_key,
+                             bucket=self._bucket_name)
+
+                self._s3_client.upload_file(tmp_zip.name, self._bucket_name, s3_key)
+
+                t_upload_done = time.monotonic()
+                logger.debug("s3_client.upload_file() returned",
+                             series_id=series_id,
+                             s3_key=s3_key)
+                logger.info("zip uploaded to S3",
+                            series_id=series_id,
+                            s3_key=s3_key,
+                            bucket=self._bucket_name,
+                            zip_size_bytes=zip_size_bytes,
+                            upload_ms=int((t_upload_done - t_zip_done) * 1000))
+
+                # Update the custom data to notify that the file is now stored in a zip in S3
+                s3_custom_data = CustomData(storage=CustomData.Storage.S3_ZIP,
+                                            local_series_folder=local_series_folder,
+                                            s3_zip_key=s3_key).to_binary()
+
+                logger.info("starting SetAttachmentCustomData loop",
+                            series_id=series_id,
+                            attachment_count=len(attachments_uuids),
+                            s3_key=s3_key)
+                t_meta_start = time.monotonic()
+
+                for idx, a_uuid in enumerate(attachments_uuids):
+                    logger.debug("calling orthanc.SetAttachmentCustomData()",
                                  series_id=series_id,
                                  uuid=a_uuid,
                                  index=idx,
-                                 size_bytes=len(content))
-                    zipf.writestr(a_uuid, content)
-                    logger.debug("attachment added to zip",
+                                 total=len(attachments_uuids))
+                    orthanc.SetAttachmentCustomData(a_uuid, s3_custom_data)
+                    logger.debug("orthanc.SetAttachmentCustomData() returned",
                                  series_id=series_id,
                                  uuid=a_uuid,
                                  index=idx)
 
-            t_zip_done = time.monotonic()
-            zip_size_bytes = os.path.getsize(tmp_zip.name)
+                t_meta_done = time.monotonic()
+                logger.info("SetAttachmentCustomData loop complete",
+                            series_id=series_id,
+                            attachment_count=len(attachments_uuids),
+                            s3_key=s3_key,
+                            metadata_update_ms=int((t_meta_done - t_meta_start) * 1000))
 
-            logger.info("zip archive built",
-                        series_id=series_id,
-                        attachment_count=len(attachments_uuids),
-                        zip_size_bytes=zip_size_bytes,
-                        uncompressed_bytes=total_uncompressed_bytes,
-                        zip_build_ms=int((t_zip_done - t0) * 1000))
-
-            # Upload to S3
-            s3_key = self._get_series_s3_key(series_id)
-            logger.info("uploading zip to S3",
-                        series_id=series_id,
+                # The marker is the eviction guard's durable signal that the
+                # folder contents are recoverable from S3. It is written while
+                # the folder lease is active so eviction cannot remove the
+                # directory between opening the marker and atomically publishing
+                # its final path.
+                if local_series_folder:
+                    self._write_s3_uploaded_marker(
+                        local_series_folder=local_series_folder,
                         s3_key=s3_key,
-                        bucket=self._bucket_name,
-                        zip_size_bytes=zip_size_bytes,
-                        uncompressed_bytes=total_uncompressed_bytes)
-            logger.debug("calling s3_client.upload_file()",
-                         series_id=series_id,
-                         s3_key=s3_key,
-                         bucket=self._bucket_name)
-
-            self._s3_client.upload_file(tmp_zip.name, self._bucket_name, s3_key)
-
-            t_upload_done = time.monotonic()
-            logger.debug("s3_client.upload_file() returned",
-                         series_id=series_id,
-                         s3_key=s3_key)
-            logger.info("zip uploaded to S3",
                         series_id=series_id,
-                        s3_key=s3_key,
-                        bucket=self._bucket_name,
-                        zip_size_bytes=zip_size_bytes,
-                        upload_ms=int((t_upload_done - t_zip_done) * 1000))
-
-            # Update the custom data to notify that the file is now stored in a zip in S3
-            s3_custom_data = CustomData(storage=CustomData.Storage.S3_ZIP,
-                                        local_series_folder=local_series_folder,
-                                        s3_zip_key=s3_key).to_binary()
-
-            logger.info("starting SetAttachmentCustomData loop",
-                        series_id=series_id,
-                        attachment_count=len(attachments_uuids),
-                        s3_key=s3_key)
-            t_meta_start = time.monotonic()
-
-            for idx, a_uuid in enumerate(attachments_uuids):
-                logger.debug("calling orthanc.SetAttachmentCustomData()",
-                             series_id=series_id,
-                             uuid=a_uuid,
-                             index=idx,
-                             total=len(attachments_uuids))
-                orthanc.SetAttachmentCustomData(a_uuid, s3_custom_data)
-                logger.debug("orthanc.SetAttachmentCustomData() returned",
-                             series_id=series_id,
-                             uuid=a_uuid,
-                             index=idx)
-
-            t_meta_done = time.monotonic()
-            logger.info("SetAttachmentCustomData loop complete",
-                        series_id=series_id,
-                        attachment_count=len(attachments_uuids),
-                        s3_key=s3_key,
-                        metadata_update_ms=int((t_meta_done - t_meta_start) * 1000))
-
-            # At this point, the local storage does not need to keep the files stored locally but there is no need to notify it.
-            # In the best scenario, the files will still be stored locally at the time we need it.
-
-            # Write a marker file so the LRU eviction guard knows this folder is safe to evict
-            if local_series_folder:
-                marker_path = os.path.join(
-                    self._local_storage.get_folder_path(local_series_folder),
-                    ".s3-uploaded"
-                )
-                try:
-                    with open(marker_path, "w") as f:
-                        f.write(s3_key)
-                    logger.debug("wrote S3 upload marker file",
-                                 series_id=series_id, marker_path=marker_path)
-                except Exception as e:
-                    logger.warning("failed to write S3 upload marker file",
-                                   series_id=series_id, error=str(e))
+                    )
 
         duration_ms = int((time.monotonic() - t0) * 1000)
 
@@ -322,6 +407,56 @@ class LocalToS3ZipManager:
                     upload_ms=int((t_upload_done - t_zip_done) * 1000),
                     metadata_update_ms=int((t_meta_done - t_meta_start) * 1000),
                     duration_ms=duration_ms)
+
+    def _write_s3_uploaded_marker(self, local_series_folder: str, s3_key: str, series_id: str):
+        folder_path = self._local_storage.get_folder_path(local_series_folder)
+        marker_path = os.path.join(folder_path, ".s3-uploaded")
+        tmp_marker_path = os.path.join(
+            folder_path,
+            f".s3-uploaded.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+
+        try:
+            os.makedirs(folder_path, exist_ok=True)
+            with open(tmp_marker_path, "w") as f:
+                f.write(s3_key)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_marker_path, marker_path)
+            self._fsync_directory_if_supported(folder_path)
+            logger.debug("wrote S3 upload marker file",
+                         series_id=series_id,
+                         marker_path=marker_path,
+                         s3_key=s3_key)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp_marker_path):
+                    os.remove(tmp_marker_path)
+            except Exception as cleanup_error:
+                logger.warning("failed to remove temporary S3 upload marker",
+                               series_id=series_id,
+                               tmp_marker_path=tmp_marker_path,
+                               error=str(cleanup_error))
+            logger.warning("failed to write S3 upload marker file",
+                           series_id=series_id,
+                           marker_path=marker_path,
+                           error=str(e))
+
+    def _fsync_directory_if_supported(self, folder_path: str):
+        if not hasattr(os, "O_DIRECTORY"):
+            return
+
+        directory_fd = None
+        try:
+            directory_fd = os.open(folder_path, os.O_RDONLY | os.O_DIRECTORY)
+            os.fsync(directory_fd)
+        except OSError as e:
+            logger.debug("directory fsync after marker write failed",
+                         folder_path=folder_path,
+                         error=str(e))
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     def _acquire_zip_retrieval(self, s3_zip_key: str) -> Tuple[ZipRetrieval, bool]:
         """Return the active retrieval object with a counted live reference.
@@ -387,11 +522,17 @@ class LocalToS3ZipManager:
             # it until the extraction and all waiters have left this retrieval.
             with self._local_storage.lease_folder(local_series_folder):
                 with zip_retrieval: # the first thread to get here keeps the condition "locked" during the zip retrieval
+                    zip_retrieval.raise_if_failed()
                     if not zip_retrieval.downloaded:
                         logger.debug("this thread will perform the S3 download",
                                      s3_zip_key=s3_zip_key)
-                        self._retrieve_zip_from_s3(s3_zip_key, local_series_folder)
-                        zip_retrieval.set_downloaded()
+                        try:
+                            self._retrieve_zip_from_s3(s3_zip_key, local_series_folder)
+                        except Exception as e:
+                            zip_retrieval.set_failed(e)
+                            raise
+                        else:
+                            zip_retrieval.set_downloaded()
                     else:
                         logger.debug("another thread already downloaded this zip, waiting",
                                      s3_zip_key=s3_zip_key)
@@ -401,10 +542,54 @@ class LocalToS3ZipManager:
 
 
     def _retrieve_zip_from_s3(self, s3_zip_key: str, local_series_folder: str):
+        started_at = time.monotonic()
+        for attempt in range(1, self._s3_retrieval_max_attempts + 1):
+            try:
+                return self._retrieve_zip_from_s3_once(
+                    s3_zip_key=s3_zip_key,
+                    local_series_folder=local_series_folder,
+                    attempt=attempt,
+                )
+            except Exception as e:
+                retryable = self._is_retryable_s3_retrieval_exception(e)
+                is_last_attempt = attempt >= self._s3_retrieval_max_attempts
+                if not retryable or is_last_attempt:
+                    logger.error(
+                        "series retrieval from S3 failed",
+                        s3_zip_key=s3_zip_key,
+                        bucket=self._bucket_name,
+                        local_series_folder=local_series_folder,
+                        attempt=attempt,
+                        max_attempts=self._s3_retrieval_max_attempts,
+                        retryable=retryable,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    )
+                    raise
+
+                delay_sec = self._get_s3_retrieval_retry_delay_sec(attempt)
+                logger.warning(
+                    "series retrieval from S3 failed, retrying",
+                    s3_zip_key=s3_zip_key,
+                    bucket=self._bucket_name,
+                    local_series_folder=local_series_folder,
+                    attempt=attempt,
+                    max_attempts=self._s3_retrieval_max_attempts,
+                    retry_delay_ms=int(delay_sec * 1000),
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+                if delay_sec > 0:
+                    time.sleep(delay_sec)
+
+    def _retrieve_zip_from_s3_once(self, s3_zip_key: str, local_series_folder: str, attempt: int):
         logger.info("series retrieval from S3 starting",
                     s3_zip_key=s3_zip_key,
                     bucket=self._bucket_name,
-                    local_series_folder=local_series_folder)
+                    local_series_folder=local_series_folder,
+                    attempt=attempt,
+                    max_attempts=self._s3_retrieval_max_attempts)
         t0 = time.monotonic()
 
         file_count = 0
@@ -460,11 +645,46 @@ class LocalToS3ZipManager:
                     s3_zip_key=s3_zip_key,
                     bucket=self._bucket_name,
                     local_series_folder=local_series_folder,
+                    attempt=attempt,
                     file_count=file_count,
                     zip_size_bytes=zip_size_bytes,
                     uncompressed_bytes=total_bytes,
                     download_ms=int((t_download_done - t0) * 1000),
                     duration_ms=duration_ms)
+
+    def _get_s3_retrieval_retry_delay_sec(self, failed_attempt: int) -> float:
+        if self._s3_retrieval_retry_base_delay_sec <= 0:
+            return 0.0
+
+        exponential_delay = self._s3_retrieval_retry_base_delay_sec * (2 ** max(0, failed_attempt - 1))
+        capped_delay = min(exponential_delay, self._s3_retrieval_retry_max_delay_sec)
+        return random.uniform(0.0, capped_delay)
+
+    def _is_retryable_s3_retrieval_exception(self, exc: BaseException) -> bool:
+        if isinstance(exc, zipfile.BadZipFile):
+            return False
+
+        if ClientError is not None and isinstance(exc, ClientError):
+            response = getattr(exc, "response", {}) or {}
+            error = response.get("Error", {}) or {}
+            metadata = response.get("ResponseMetadata", {}) or {}
+            error_code = error.get("Code")
+            http_status_code = metadata.get("HTTPStatusCode")
+            if error_code in _PERMANENT_CLIENT_ERROR_CODES:
+                return False
+            if error_code in _TRANSIENT_CLIENT_ERROR_CODES:
+                return True
+            if http_status_code in _TRANSIENT_HTTP_STATUS_CODES:
+                return True
+            return False
+
+        if _TRANSIENT_BOTOCORE_EXCEPTIONS and isinstance(exc, _TRANSIENT_BOTOCORE_EXCEPTIONS):
+            return True
+
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return True
+
+        return False
 
 
     def _get_instances_attachments(self, series_id: str) -> List[str]:

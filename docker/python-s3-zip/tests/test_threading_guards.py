@@ -2,6 +2,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 import zipfile
@@ -40,6 +42,7 @@ orthanc_stub = types.SimpleNamespace(
     DicomInstance=_DicomInstance,
     LogInfo=lambda message: None,
     SetCurrentThreadName=lambda name: None,
+    SetAttachmentCustomData=lambda uuid, custom_data: None,
 )
 sys.modules.setdefault("orthanc", orthanc_stub)
 sys.modules.setdefault("boto3", types.SimpleNamespace(client=object))
@@ -107,6 +110,24 @@ class FolderLeaseTests(unittest.TestCase):
             self.assertEqual(storage._reserved_bytes, 0)
             self.assertEqual(storage._available_size, 0)
             self.assertFalse(storage._scan_in_progress)
+
+    def test_eviction_keeps_folder_queued_when_delete_fails(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "series")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "instance"), "wb") as f:
+                f.write(b"abc")
+
+            with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_for(root)):
+                storage = LocalStorage(root=root, max_size_mb=1)
+                storage.set_eviction_guard(lambda folder_name: True)
+
+                with mock.patch("local_storage.shutil.rmtree", side_effect=OSError("locked")):
+                    result = storage.evict_all_safe()
+
+            self.assertEqual(result.freed_folders, 0)
+            self.assertEqual(result.skipped_folders, 1)
+            self.assertTrue(os.path.isdir(folder))
 
 
 class _ReadPathLocalStorage:
@@ -197,14 +218,53 @@ class _ZipS3Client:
             zipf.writestr("b", b"B")
 
 
+class _FlakyZipS3Client:
+    def __init__(self, failures_before_success):
+        self.failures_before_success = failures_before_success
+        self.download_attempts = 0
+
+    def download_file(self, bucket_name, s3_zip_key, destination_path):
+        self.download_attempts += 1
+        if self.download_attempts <= self.failures_before_success:
+            raise ConnectionError("temporary S3 connection glitch")
+        with zipfile.ZipFile(destination_path, "w") as zipf:
+            zipf.writestr("a", b"A")
+
+
+class _BadZipS3Client:
+    def __init__(self):
+        self.download_attempts = 0
+
+    def download_file(self, bucket_name, s3_zip_key, destination_path):
+        self.download_attempts += 1
+        with open(destination_path, "wb") as f:
+            f.write(b"this is not a zip")
+
+
+class _BlockingFailS3Client:
+    def __init__(self):
+        self.download_started = threading.Event()
+        self.release_failure = threading.Event()
+        self.download_attempts = 0
+
+    def download_file(self, bucket_name, s3_zip_key, destination_path):
+        self.download_attempts += 1
+        self.download_started.set()
+        self.release_failure.wait(timeout=5)
+        raise ConnectionError("shared retrieval failure")
+
+
 class ZipRetrievalTests(unittest.TestCase):
-    def _new_manager(self, local_storage):
+    def _new_manager(self, local_storage, s3_client=None, max_attempts=3):
         return LocalToS3ZipManager(
-            s3_client=_ZipS3Client(),
+            s3_client=s3_client or _ZipS3Client(),
             bucket_name="bucket",
             local_storage=local_storage,
             enable_compression=False,
             uncommitted_series_handler=object(),
+            s3_retrieval_max_attempts=max_attempts,
+            s3_retrieval_retry_base_delay_sec=0,
+            s3_retrieval_retry_max_delay_sec=0,
         )
 
     def test_retrieval_refcount_is_owned_by_manager_lock(self):
@@ -242,6 +302,169 @@ class ZipRetrievalTests(unittest.TestCase):
         self.assertGreaterEqual(local_storage.max_lease_depth, 1)
         self.assertEqual(local_storage.lease_depth, 0)
         self.assertEqual(manager._s3_zip_retrievals, {})
+
+    def test_retrieve_zip_from_s3_retries_transient_download_failure(self):
+        local_storage = _RetrievalLocalStorage()
+        s3_client = _FlakyZipS3Client(failures_before_success=2)
+        manager = self._new_manager(local_storage, s3_client=s3_client, max_attempts=3)
+
+        manager.retrieve_zip_from_s3(
+            s3_zip_key="series.zip",
+            local_series_folder="series",
+        )
+
+        self.assertEqual(s3_client.download_attempts, 3)
+        self.assertEqual(local_storage.writes, [("series", "a", b"A")])
+        self.assertEqual(manager._s3_zip_retrievals, {})
+
+    def test_retrieve_zip_from_s3_does_not_retry_bad_zip(self):
+        local_storage = _RetrievalLocalStorage()
+        s3_client = _BadZipS3Client()
+        manager = self._new_manager(local_storage, s3_client=s3_client, max_attempts=3)
+
+        with self.assertRaises(zipfile.BadZipFile):
+            manager.retrieve_zip_from_s3(
+                s3_zip_key="series.zip",
+                local_series_folder="series",
+            )
+
+        self.assertEqual(s3_client.download_attempts, 1)
+        self.assertEqual(local_storage.writes, [])
+        self.assertEqual(manager._s3_zip_retrievals, {})
+
+    def test_waiting_retrieval_callers_share_terminal_failure(self):
+        local_storage = _RetrievalLocalStorage()
+        s3_client = _BlockingFailS3Client()
+        manager = self._new_manager(local_storage, s3_client=s3_client, max_attempts=1)
+        errors = []
+
+        def retrieve():
+            try:
+                manager.retrieve_zip_from_s3(
+                    s3_zip_key="series.zip",
+                    local_series_folder="series",
+                )
+            except Exception as e:
+                errors.append(e)
+
+        first = threading.Thread(target=retrieve)
+        second = threading.Thread(target=retrieve)
+        first.start()
+        self.assertTrue(s3_client.download_started.wait(timeout=5))
+        second.start()
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with manager._s3_zip_retrievals_lock:
+                retrieval = manager._s3_zip_retrievals.get("series.zip")
+                ref_count = retrieval._ref_count if retrieval is not None else 0
+            if ref_count >= 2:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("second retrieval caller did not acquire the shared ZipRetrieval")
+
+        s3_client.release_failure.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all(isinstance(e, ConnectionError) for e in errors))
+        self.assertEqual(s3_client.download_attempts, 1)
+        self.assertEqual(manager._s3_zip_retrievals, {})
+
+
+class _CopyLocalStorage:
+    def __init__(self, root):
+        self.root = root
+        self.lease_depth = 0
+        self.max_lease_depth = 0
+        self.reads = []
+
+    @contextmanager
+    def lease_folder(self, local_series_folder):
+        self.lease_depth += 1
+        self.max_lease_depth = max(self.max_lease_depth, self.lease_depth)
+        try:
+            yield
+        finally:
+            self.lease_depth -= 1
+
+    def read_file(self, uuid, local_series_folder):
+        if self.lease_depth <= 0:
+            raise AssertionError("read_file called without a folder lease")
+        self.reads.append((uuid, local_series_folder))
+        return f"content-{uuid}".encode("ascii")
+
+    def write_file(self, local_series_folder, uuid, content):
+        raise AssertionError("write_file is not used by copy_series_to_s3")
+
+    def get_folder_path(self, local_series_folder):
+        return os.path.join(self.root, local_series_folder)
+
+
+class _UploadS3Client:
+    def __init__(self):
+        self.uploads = []
+        self.uploaded_zip_entries = []
+
+    def upload_file(self, source_path, bucket_name, s3_key):
+        self.uploads.append((bucket_name, s3_key))
+        with zipfile.ZipFile(source_path, "r") as zipf:
+            self.uploaded_zip_entries = sorted(zipf.namelist())
+
+
+class _UncommittedHandler:
+    def __init__(self):
+        self.committed = []
+
+    def on_committed_series(self, series_id):
+        self.committed.append(series_id)
+
+
+class CopySeriesToS3Tests(unittest.TestCase):
+    def test_copy_series_to_s3_leases_source_folder_and_writes_marker_atomically(self):
+        with tempfile.TemporaryDirectory() as root:
+            local_storage = _CopyLocalStorage(root)
+            s3_client = _UploadS3Client()
+            uncommitted_handler = _UncommittedHandler()
+            manager = LocalToS3ZipManager(
+                s3_client=s3_client,
+                bucket_name="bucket",
+                local_storage=local_storage,
+                enable_compression=False,
+                uncommitted_series_handler=uncommitted_handler,
+                s3_retrieval_retry_base_delay_sec=0,
+                s3_retrieval_retry_max_delay_sec=0,
+            )
+
+            custom_data = CustomData(
+                storage=CustomData.Storage.LOCAL,
+                local_series_folder="series",
+            )
+            set_custom_data_calls = []
+
+            with mock.patch.object(manager, "_get_instances_attachments", return_value=["a", "b"]):
+                with mock.patch.object(CustomData, "from_orthanc_attachment", return_value=custom_data):
+                    with mock.patch.object(
+                        orthanc_stub,
+                        "SetAttachmentCustomData",
+                        side_effect=lambda uuid, data: set_custom_data_calls.append((uuid, data)),
+                    ):
+                        manager.copy_series_to_s3("orthanc-series")
+
+            self.assertEqual(local_storage.reads, [("a", "series"), ("b", "series")])
+            self.assertGreaterEqual(local_storage.max_lease_depth, 1)
+            self.assertEqual(local_storage.lease_depth, 0)
+            self.assertEqual(s3_client.uploads, [("bucket", "orthanc-series.zip")])
+            self.assertEqual(s3_client.uploaded_zip_entries, ["a", "b"])
+            self.assertEqual([uuid for uuid, _ in set_custom_data_calls], ["a", "b"])
+            self.assertEqual(uncommitted_handler.committed, ["orthanc-series"])
+            marker_path = os.path.join(root, "series", ".s3-uploaded")
+            with open(marker_path, "r") as f:
+                self.assertEqual(f.read(), "orthanc-series.zip")
 
 
 if __name__ == "__main__":
