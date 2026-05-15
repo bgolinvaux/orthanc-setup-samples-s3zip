@@ -47,30 +47,30 @@ class LocalToS3ZipManager:
             self._ref_count = 0
             self._manager = manager
             self._downloaded = False
-            logger.debug("ZipRetrieval created", s3_zip_key=series_id)
+            logger.debug("ZipRetrieval created", series_id=series_id)
 
         def __enter__(self):
             logger.debug("ZipRetrieval entering (acquiring condition)",
-                         s3_zip_key=self.series_id,
+                         series_id=self.series_id,
                          ref_count=self._ref_count + 1)
             self._ref_count += 1
             self._condition.__enter__()
             logger.debug("ZipRetrieval entered (condition acquired)",
-                         s3_zip_key=self.series_id,
+                         series_id=self.series_id,
                          ref_count=self._ref_count)
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             logger.debug("ZipRetrieval exiting",
-                         s3_zip_key=self.series_id,
+                         series_id=self.series_id,
                          ref_count=self._ref_count)
             self._ref_count -= 1
             self._condition.__exit__(exc_type, exc_val, exc_tb)
             if self._ref_count == 0:
                 logger.debug("ZipRetrieval ref_count reached 0, discarding",
-                             s3_zip_key=self.series_id)
+                             series_id=self.series_id)
                 self._manager._discard_zip_retrieval(self.series_id)
             logger.debug("ZipRetrieval exited",
-                         s3_zip_key=self.series_id,
+                         series_id=self.series_id,
                          ref_count=self._ref_count)
 
         @property
@@ -79,17 +79,17 @@ class LocalToS3ZipManager:
 
         def set_downloaded(self):
             logger.debug("ZipRetrieval set_downloaded, notifying waiters",
-                         s3_zip_key=self.series_id)
+                         series_id=self.series_id)
             self._downloaded = True
             self._condition.notify_all()
 
         def wait_downloaded(self):
             logger.debug("ZipRetrieval waiting for download to complete",
-                         s3_zip_key=self.series_id)
+                         series_id=self.series_id)
             while not self._downloaded:
                 self._condition.wait()
             logger.debug("ZipRetrieval download wait completed",
-                         s3_zip_key=self.series_id)
+                         series_id=self.series_id)
 
     _s3_client: S3Client
     _local_storage: LocalStorageInterface
@@ -492,4 +492,4 @@ class LocalToS3ZipManager:
                 status.s3_zip_key = cd.s3_zip_key
 
         return status
-    
+
