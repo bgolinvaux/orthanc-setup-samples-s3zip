@@ -8,6 +8,10 @@ class LocalStorageInterface(ABC):
         pass
 
     @abstractmethod
+    def folder_marker_critical_section(self, local_series_folder: str) -> AbstractContextManager[None]:
+        pass
+
+    @abstractmethod
     def write_file(self, local_series_folder: str, uuid: str, content: bytes):
         pass
 

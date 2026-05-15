@@ -143,10 +143,14 @@ class S3ZipStorage:
 
         # Any new file invalidates "everything in this folder is on S3". Wipe
         # the marker so eviction cannot purge the folder before the next copy
-        # captures this instance. A racing concurrent copy that recheck-skips
-        # its own marker write keeps the invariant intact. Idempotent on a
-        # missing marker, so safe to call even when create() failed.
-        _ = self._zip_manager.invalidate_s3_uploaded_marker(series_hash)
+        # captures this instance. The per-folder critical section pairs with
+        # the matching one in copy_series_to_s3 around its recheck+marker
+        # write: ordering between the two is now sequential, so a stale
+        # marker cannot be published after this invalidate runs as a no-op.
+        # Idempotent on a missing marker, so safe to call even when create()
+        # failed.
+        with self._local_storage.folder_marker_critical_section(series_hash):
+            _ = self._zip_manager.invalidate_s3_uploaded_marker(local_series_folder=series_hash)
 
         custom_data = CustomData(CustomData.Storage.LOCAL, local_series_folder=series_hash)
 

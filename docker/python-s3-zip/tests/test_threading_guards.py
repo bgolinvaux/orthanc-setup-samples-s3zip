@@ -180,6 +180,121 @@ class FolderLeaseTests(unittest.TestCase):
                 storage._update_local_storage_stats()
             self.assertFalse(storage._scan_in_progress)
 
+    def test_folder_marker_critical_section_serializes_same_folder(self):
+        # Two threads asking for the SAME folder's CS must serialize. Two
+        # threads asking for DIFFERENT folders must run in parallel.
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_for(root)):
+                storage = LocalStorage(root=root, max_size_mb=1)
+
+            inside_same = threading.Event()
+            release_same = threading.Event()
+            second_acquired_same = threading.Event()
+
+            def first_same():
+                with storage.folder_marker_critical_section("series"):
+                    inside_same.set()
+                    self.assertTrue(release_same.wait(timeout=2))
+
+            def second_same():
+                self.assertTrue(inside_same.wait(timeout=2))
+                # Should block until release_same fires.
+                with storage.folder_marker_critical_section("series"):
+                    second_acquired_same.set()
+
+            t1 = threading.Thread(target=first_same)
+            t2 = threading.Thread(target=second_same)
+            t1.start(); t2.start()
+            self.assertTrue(inside_same.wait(timeout=2))
+            self.assertFalse(
+                second_acquired_same.wait(timeout=0.1),
+                "second caller for same folder must wait while first holds the section",
+            )
+            release_same.set()
+            t1.join(timeout=2); t2.join(timeout=2)
+            self.assertTrue(second_acquired_same.is_set())
+            self.assertEqual(storage._folder_marker_cs_locks, {})
+
+            # Different folder: must NOT block.
+            inside_a = threading.Event()
+            release_a = threading.Event()
+            inside_b = threading.Event()
+
+            def folder_a():
+                with storage.folder_marker_critical_section("a"):
+                    inside_a.set()
+                    self.assertTrue(release_a.wait(timeout=2))
+
+            def folder_b():
+                self.assertTrue(inside_a.wait(timeout=2))
+                with storage.folder_marker_critical_section("b"):
+                    inside_b.set()
+
+            ta = threading.Thread(target=folder_a)
+            tb = threading.Thread(target=folder_b)
+            ta.start(); tb.start()
+            self.assertTrue(
+                inside_b.wait(timeout=2),
+                "different-folder caller must not be blocked by holder of another folder",
+            )
+            release_a.set()
+            ta.join(timeout=2); tb.join(timeout=2)
+            self.assertEqual(storage._folder_marker_cs_locks, {})
+
+    def test_marker_critical_section_prevents_stale_marker_in_race_window(self):
+        # The classic interleaving the mutex is here to forbid:
+        #   copy:   takes CS, runs recheck (snapshot match) -> writes marker
+        #   create: takes CS afterwards, deletes marker
+        # End state must be NO marker. Without the mutex, create's invalidate
+        # could land between copy's recheck and copy's marker write, leaving
+        # a stale marker that hides an un-uploaded file.
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_for(root)):
+                storage = LocalStorage(root=root, max_size_mb=1)
+
+            folder = os.path.join(root, "series")
+            os.makedirs(folder)
+            marker_path = os.path.join(folder, ".s3-uploaded")
+
+            copy_inside_cs = threading.Event()
+            copy_finished_recheck = threading.Event()
+            create_done = threading.Event()
+
+            def copy_side():
+                with storage.folder_marker_critical_section("series"):
+                    copy_inside_cs.set()
+                    # Let create_side try (and block) before we publish.
+                    time.sleep(0.05)
+                    copy_finished_recheck.set()
+                    with open(marker_path, "w") as f:
+                        _ = f.write("series.zip")
+
+            def create_side():
+                self.assertTrue(copy_inside_cs.wait(timeout=2))
+                # This must block on the mutex until copy_side releases.
+                with storage.folder_marker_critical_section("series"):
+                    self.assertTrue(
+                        copy_finished_recheck.is_set(),
+                        "create entered CS before copy finished its recheck-and-publish window",
+                    )
+                    try:
+                        os.remove(marker_path)
+                    except FileNotFoundError:
+                        pass
+                    create_done.set()
+
+            t_copy = threading.Thread(target=copy_side)
+            t_create = threading.Thread(target=create_side)
+            t_copy.start(); t_create.start()
+            t_copy.join(timeout=2); t_create.join(timeout=2)
+
+            self.assertTrue(create_done.is_set())
+            self.assertFalse(
+                os.path.exists(marker_path),
+                "create's invalidate must win the end state; mutex orders the two",
+            )
+            self.assertEqual(storage._folder_marker_cs_locks, {})
+
     def test_remove_swallows_filenotfound_race_with_eviction(self):
         # Eviction can rmtree the parent folder between `os.path.exists` and
         # `os.remove`. The remove path must absorb that race instead of letting
@@ -588,6 +703,8 @@ class _CopyLocalStorage:
         self.root = root
         self.lease_depth = 0
         self.max_lease_depth = 0
+        self.marker_cs_depth = 0
+        self.max_marker_cs_depth = 0
         self.reads = []
 
     @contextmanager
@@ -598,6 +715,15 @@ class _CopyLocalStorage:
             yield
         finally:
             self.lease_depth -= 1
+
+    @contextmanager
+    def folder_marker_critical_section(self, local_series_folder):
+        self.marker_cs_depth += 1
+        self.max_marker_cs_depth = max(self.max_marker_cs_depth, self.marker_cs_depth)
+        try:
+            yield
+        finally:
+            self.marker_cs_depth -= 1
 
     def read_file(self, uuid, local_series_folder):
         if self.lease_depth <= 0:

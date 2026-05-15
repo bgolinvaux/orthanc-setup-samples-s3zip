@@ -94,9 +94,10 @@ class LocalStorage(LocalStorageInterface):
     _active_writers: int
     _scan_in_progress: bool
     _reserved_bytes: int
-    _folder_lease_counts: Dict[str, int]
+    _folder_lease_counts: dict[str, int]
+    _folder_marker_cs_locks: dict[str, tuple[threading.Lock, int]]
     _folder_stats: queue.PriorityQueue[FolderStatEntry]
-    _is_folder_safe_to_evict: Optional[Callable[[str], bool]]
+    _is_folder_safe_to_evict: Callable[[str], bool] | None
 
     def __init__(self, root: str, max_size_mb: int) -> None:
         self._root = root
@@ -107,6 +108,7 @@ class LocalStorage(LocalStorageInterface):
         self._scan_in_progress = False
         self._reserved_bytes = 0
         self._folder_lease_counts = {}
+        self._folder_marker_cs_locks = {}
         self._is_folder_safe_to_evict = None
 
         self._update_local_storage_stats()
@@ -169,6 +171,50 @@ class LocalStorage(LocalStorageInterface):
 
     def _get_folder_lease_count(self, local_series_folder: str) -> int:
         return self._folder_lease_counts.get(local_series_folder, 0)
+
+    @contextmanager
+    def folder_marker_critical_section(self, local_series_folder: str) -> Iterator[None]:
+        """Per-folder mutex for marker publish/invalidate operations.
+
+        Two paths race for the marker file: ``copy_series_to_s3`` writes it
+        after a final attachment-set recheck, and ``storage_create`` deletes
+        it whenever a new instance lands on disk. Without serialization, the
+        copy can publish a marker AFTER the create's delete has already run
+        as a no-op, leaving a stale marker that hides an un-uploaded file.
+
+        Acquiring is refcounted: the underlying ``threading.Lock`` is created
+        lazily on first use and removed from the dict when no thread is in
+        the section, so memory does not grow with the lifetime catalogue of
+        series folders.
+        """
+        lock = self._acquire_folder_marker_cs(local_series_folder)
+        try:
+            with lock:
+                yield
+        finally:
+            self._release_folder_marker_cs(local_series_folder)
+
+    def _acquire_folder_marker_cs(self, local_series_folder: str) -> threading.Lock:
+        with self._lock:
+            entry = self._folder_marker_cs_locks.get(local_series_folder)
+            if entry is None:
+                new_lock = threading.Lock()
+                self._folder_marker_cs_locks[local_series_folder] = (new_lock, 1)
+                return new_lock
+            existing_lock, count = entry
+            self._folder_marker_cs_locks[local_series_folder] = (existing_lock, count + 1)
+            return existing_lock
+
+    def _release_folder_marker_cs(self, local_series_folder: str) -> None:
+        with self._lock:
+            entry = self._folder_marker_cs_locks.get(local_series_folder)
+            if entry is None:
+                return
+            existing_lock, count = entry
+            if count <= 1:
+                del self._folder_marker_cs_locks[local_series_folder]
+            else:
+                self._folder_marker_cs_locks[local_series_folder] = (existing_lock, count - 1)
 
     def _update_local_storage_stats(self) -> None:
         self._pause_writes_for_scan()
