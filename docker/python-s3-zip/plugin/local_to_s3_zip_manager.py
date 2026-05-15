@@ -5,7 +5,7 @@ import os
 import tempfile
 import threading
 import time
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from boto3 import client as S3Client
 from local_storage_interface import LocalStorageInterface
 from uncommitted_series_handler import UncommittedSeriesHandler
@@ -38,37 +38,30 @@ class LocalToS3ZipManager:
         series_id: str
         _condition: threading.Condition
         _ref_count: int
-        _manager: 'LocalToS3ZipManager'
         _downloaded: bool
 
-        def __init__(self, series_id: str, manager: 'LocalToS3ZipManager'):
+        def __init__(self, series_id: str):
             self.series_id = series_id
             self._condition = threading.Condition()
             self._ref_count = 0
-            self._manager = manager
             self._downloaded = False
             logger.debug("ZipRetrieval created", series_id=series_id)
 
         def __enter__(self):
             logger.debug("ZipRetrieval entering (acquiring condition)",
                          series_id=self.series_id,
-                         ref_count=self._ref_count + 1)
-            self._ref_count += 1
+                         ref_count=self._ref_count)
             self._condition.__enter__()
             logger.debug("ZipRetrieval entered (condition acquired)",
                          series_id=self.series_id,
                          ref_count=self._ref_count)
+            return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             logger.debug("ZipRetrieval exiting",
                          series_id=self.series_id,
                          ref_count=self._ref_count)
-            self._ref_count -= 1
             self._condition.__exit__(exc_type, exc_val, exc_tb)
-            if self._ref_count == 0:
-                logger.debug("ZipRetrieval ref_count reached 0, discarding",
-                             series_id=self.series_id)
-                self._manager._discard_zip_retrieval(self.series_id)
             logger.debug("ZipRetrieval exited",
                          series_id=self.series_id,
                          ref_count=self._ref_count)
@@ -330,10 +323,42 @@ class LocalToS3ZipManager:
                     metadata_update_ms=int((t_meta_done - t_meta_start) * 1000),
                     duration_ms=duration_ms)
 
-    def _discard_zip_retrieval(self, series_id: str):
+    def _acquire_zip_retrieval(self, s3_zip_key: str) -> Tuple[ZipRetrieval, bool]:
+        """Return the active retrieval object with a counted live reference.
+
+        Lookup/create and refcount increment share the same lock. A thread must
+        not leave this method with an uncounted object: if another thread
+        completes the retrieval before this caller enters the condition, the
+        active dictionary entry still has to stay alive for this caller.
+        """
         with self._s3_zip_retrievals_lock:
-            del self._s3_zip_retrievals[series_id]
-            logger.debug("discarded ZipRetrieval", s3_zip_key=series_id)
+            is_new_retrieval = False
+            if s3_zip_key not in self._s3_zip_retrievals:
+                self._s3_zip_retrievals[s3_zip_key] = LocalToS3ZipManager.ZipRetrieval(s3_zip_key)
+                is_new_retrieval = True
+            zip_retrieval = self._s3_zip_retrievals[s3_zip_key]
+            zip_retrieval._ref_count += 1
+            logger.debug("acquired ZipRetrieval",
+                         s3_zip_key=s3_zip_key,
+                         ref_count=zip_retrieval._ref_count,
+                         is_new_retrieval=is_new_retrieval)
+            return zip_retrieval, is_new_retrieval
+
+
+    def _release_zip_retrieval(self, zip_retrieval: ZipRetrieval):
+        """Release a counted retrieval reference and discard it when idle."""
+        with self._s3_zip_retrievals_lock:
+            zip_retrieval._ref_count -= 1
+            logger.debug("released ZipRetrieval",
+                         s3_zip_key=zip_retrieval.series_id,
+                         ref_count=zip_retrieval._ref_count)
+            if zip_retrieval._ref_count == 0:
+                if self._s3_zip_retrievals.get(zip_retrieval.series_id) is zip_retrieval:
+                    del self._s3_zip_retrievals[zip_retrieval.series_id]
+                    logger.debug("discarded ZipRetrieval", s3_zip_key=zip_retrieval.series_id)
+                else:
+                    logger.warning("ZipRetrieval release found a different active retrieval",
+                                   s3_zip_key=zip_retrieval.series_id)
 
 
     def get_s3_zip_stream(self, series_id: str):  # returns a stream
@@ -349,28 +374,30 @@ class LocalToS3ZipManager:
 
     def retrieve_zip_from_s3(self, s3_zip_key: str, local_series_folder: str):
         # make sure we do not retrieve the same file multiple times at the same time
-        is_new_retrieval = False
-        with self._s3_zip_retrievals_lock:  # global lock to safely manipulate the retrieval dict
-            if s3_zip_key not in self._s3_zip_retrievals:
-                self._s3_zip_retrievals[s3_zip_key] = LocalToS3ZipManager.ZipRetrieval(s3_zip_key, manager=self)
-                is_new_retrieval = True
-            zip_retrieval = self._s3_zip_retrievals[s3_zip_key]
+        zip_retrieval, is_new_retrieval = self._acquire_zip_retrieval(s3_zip_key)
 
         logger.debug("retrieve_zip_from_s3 entered",
                      s3_zip_key=s3_zip_key,
                      local_series_folder=local_series_folder,
                      is_new_retrieval=is_new_retrieval)
 
-        with zip_retrieval: # the first thread to get here keeps the condition "locked" during the zip retrieval
-            if not zip_retrieval.downloaded:
-                logger.debug("this thread will perform the S3 download",
-                             s3_zip_key=s3_zip_key)
-                self._retrieve_zip_from_s3(s3_zip_key, local_series_folder)
-                zip_retrieval.set_downloaded()
-            else:
-                logger.debug("another thread already downloaded this zip, waiting",
-                             s3_zip_key=s3_zip_key)
-                zip_retrieval.wait_downloaded()
+        try:
+            # The zip is extracted as several file writes. A folder may already
+            # contain an S3 marker from an earlier upload, so eviction must skip
+            # it until the extraction and all waiters have left this retrieval.
+            with self._local_storage.lease_folder(local_series_folder):
+                with zip_retrieval: # the first thread to get here keeps the condition "locked" during the zip retrieval
+                    if not zip_retrieval.downloaded:
+                        logger.debug("this thread will perform the S3 download",
+                                     s3_zip_key=s3_zip_key)
+                        self._retrieve_zip_from_s3(s3_zip_key, local_series_folder)
+                        zip_retrieval.set_downloaded()
+                    else:
+                        logger.debug("another thread already downloaded this zip, waiting",
+                                     s3_zip_key=s3_zip_key)
+                        zip_retrieval.wait_downloaded()
+        finally:
+            self._release_zip_retrieval(zip_retrieval)
 
 
     def _retrieve_zip_from_s3(self, s3_zip_key: str, local_series_folder: str):
@@ -492,4 +519,3 @@ class LocalToS3ZipManager:
                 status.s3_zip_key = cd.s3_zip_key
 
         return status
-

@@ -9,3 +9,8 @@ dependencies = [
     "orthanc-tools>=0.17.17",
     "python-on-whales>=0.80.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

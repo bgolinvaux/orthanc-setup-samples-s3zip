@@ -8,8 +8,9 @@ import threading
 import subprocess
 import queue
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, Callable, ClassVar, Dict, Iterator, List, Optional, Tuple
 from local_storage_interface import LocalStorageInterface
 from collections import deque
 from s3zip_logging import get_logger
@@ -93,6 +94,7 @@ class LocalStorage(LocalStorageInterface):
     _active_writers: int
     _scan_in_progress: bool
     _reserved_bytes: int
+    _folder_lease_counts: Dict[str, int]
     _folder_stats: queue.PriorityQueue[FolderStatEntry]
     _is_folder_safe_to_evict: Optional[Callable[[str], bool]]
 
@@ -104,6 +106,7 @@ class LocalStorage(LocalStorageInterface):
         self._active_writers = 0
         self._scan_in_progress = False
         self._reserved_bytes = 0
+        self._folder_lease_counts = {}
         self._is_folder_safe_to_evict = None
 
         self._update_local_storage_stats()
@@ -121,6 +124,51 @@ class LocalStorage(LocalStorageInterface):
         - If this callback is not set, all folders are considered safe to evict.
         """
         self._is_folder_safe_to_evict = is_folder_safe_to_evict
+
+    @contextmanager
+    def lease_folder(self, local_series_folder: str) -> Iterator[None]:
+        """Keep a series folder stable while a caller depends on its contents.
+
+        Eviction removes whole series folders. A caller that checks a file path
+        and then opens it, or extracts several files into the same folder, needs
+        the folder to remain present for the full operation rather than only for
+        one filesystem call. The lease is a refcount checked by eviction; it is
+        not a global I/O mutex.
+        """
+        self._acquire_folder_lease(local_series_folder)
+        try:
+            yield
+        finally:
+            self._release_folder_lease(local_series_folder)
+
+    def _acquire_folder_lease(self, local_series_folder: str) -> None:
+        with self._lock:
+            self._folder_lease_counts[local_series_folder] = (
+                self._folder_lease_counts.get(local_series_folder, 0) + 1
+            )
+            logger.debug(
+                "LocalStorage: folder lease acquired",
+                local_series_folder=local_series_folder,
+                lease_count=self._folder_lease_counts[local_series_folder],
+            )
+
+    def _release_folder_lease(self, local_series_folder: str) -> None:
+        with self._lock:
+            lease_count = self._folder_lease_counts.get(local_series_folder, 0)
+            if lease_count <= 1:
+                self._folder_lease_counts.pop(local_series_folder, None)
+                lease_count = 0
+            else:
+                lease_count -= 1
+                self._folder_lease_counts[local_series_folder] = lease_count
+            logger.debug(
+                "LocalStorage: folder lease released",
+                local_series_folder=local_series_folder,
+                lease_count=lease_count,
+            )
+
+    def _get_folder_lease_count(self, local_series_folder: str) -> int:
+        return self._folder_lease_counts.get(local_series_folder, 0)
 
     def _update_local_storage_stats(self) -> None:
         self._pause_writes_for_scan()
@@ -212,10 +260,11 @@ class LocalStorage(LocalStorageInterface):
                 ``None`` to drain the LRU queue completely (i.e. evict
                 everything that the eviction guard considers safe to evict).
 
-        Folders without a ``.s3-uploaded`` marker are protected by the
-        eviction guard set via ``set_eviction_guard`` and are skipped, then
-        put back into the queue at the end so they remain candidates for
-        future eviction.
+        Folders with active leases are skipped because another thread is using
+        their contents across multiple filesystem calls. Folders without a
+        ``.s3-uploaded`` marker are protected by the eviction guard set via
+        ``set_eviction_guard``. Skipped folders are put back into the queue so
+        they remain candidates for future eviction.
         """
         skipped: List[FolderStatEntry] = []
         freed_bytes: int = 0
@@ -231,6 +280,15 @@ class LocalStorage(LocalStorageInterface):
             _, path, folder_size = entry
 
             folder_name: str = os.path.basename(path)
+            lease_count = self._get_folder_lease_count(folder_name)
+            if lease_count > 0:
+                logger.info(
+                    "LocalStorage: skipping eviction of leased folder",
+                    folder=folder_name,
+                    folder_size=folder_size,
+                    lease_count=lease_count)
+                skipped.append(entry)
+                continue
 
             if self._is_folder_safe_to_evict is not None:
                 try:
@@ -313,8 +371,10 @@ class LocalStorage(LocalStorageInterface):
                 reserved_bytes=self._reserved_bytes,
             )
 
-        self._pause_writes_for_scan()
+        scan_paused = False
         try:
+            self._pause_writes_for_scan()
+            scan_paused = True
             self._update_local_storage_stats_with_writes_paused()
 
             logger.debug(
@@ -360,8 +420,12 @@ class LocalStorage(LocalStorageInterface):
                         protected_folders=result.skipped_folders,
                         max_size_mb=self._max_size // (1024 * 1024),
                     )
+        except Exception:
+            self._rollback_write_reservation(reservation_size)
+            raise
         finally:
-            self._resume_writes_after_scan()
+            if scan_paused:
+                self._resume_writes_after_scan()
 
         return reservation_size
 

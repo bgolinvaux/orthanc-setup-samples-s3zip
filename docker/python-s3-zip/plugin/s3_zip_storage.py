@@ -155,69 +155,67 @@ class S3ZipStorage:
                      local_series_folder=cd.local_series_folder,
                      s3_zip_key=cd.s3_zip_key or "<none>")
 
-        # TODO: implement a LocalFileLocker with __enter__ & __exit__ to make sure the file is not deleted in the meantime
-        logger.debug("calling local_storage.has_local_file()", uuid=uuid)
-        has_local = self._local_storage.has_local_file(uuid=uuid,
-                                                       local_series_folder=cd.local_series_folder,
-                                                       content_type=content_type)
-        logger.debug("local_storage.has_local_file() returned", uuid=uuid, has_local=has_local)
+        # Eviction removes whole series folders. Keep the folder leased from the
+        # local existence check through the final read so a safe-to-evict folder
+        # cannot disappear between `has_local_file()` and `read_range()`.
+        with self._local_storage.lease_folder(cd.local_series_folder):
+            logger.debug("calling local_storage.has_local_file()", uuid=uuid)
+            has_local = self._local_storage.has_local_file(uuid=uuid,
+                                                           local_series_folder=cd.local_series_folder,
+                                                           content_type=content_type)
+            logger.debug("local_storage.has_local_file() returned", uuid=uuid, has_local=has_local)
 
-        if not has_local:
-            s3_zip_key = cd.s3_zip_key
+            if not has_local:
+                s3_zip_key = cd.s3_zip_key
 
-            if s3_zip_key is None:
-                # The custom data says "local" but the file is gone (pod restart with
-                # ephemeral storage, or LRU eviction before S3 upload).
-                # Try to recover by checking if a marker file left by the S3 copy thread
-                # tells us the S3 key.
-                marker_path = os.path.join(
-                    self._local_storage.get_folder_path(cd.local_series_folder),
-                    ".s3-uploaded"
-                )
-                if os.path.exists(marker_path):
-                    with open(marker_path, "r") as f:
-                        s3_zip_key = f.read().strip()
-                    logger.warning(
-                        "instance marked as local but file is gone; recovered S3 key from marker",
-                        uuid=uuid,
-                        s3_zip_key=s3_zip_key,
-                        local_series_folder=cd.local_series_folder)
-                else:
-                    logger.error(
-                        "instance marked as local but file is gone and no S3 key available. "
-                        "DATA LOSS: this instance cannot be retrieved.",
-                        uuid=uuid,
-                        local_series_folder=cd.local_series_folder)
-                    return orthanc.ErrorCode.UNKNOWN_RESOURCE, None
+                if s3_zip_key is None:
+                    # Custom data can still point to local storage after a pod restart
+                    # or cache eviction. A completed upload leaves a marker in the
+                    # series folder so reads can recover the S3 key without querying
+                    # every instance attachment again.
+                    marker_path = os.path.join(
+                        self._local_storage.get_folder_path(cd.local_series_folder),
+                        ".s3-uploaded"
+                    )
+                    if os.path.exists(marker_path):
+                        with open(marker_path, "r") as f:
+                            s3_zip_key = f.read().strip()
+                        logger.warning(
+                            "instance marked as local but file is gone; recovered S3 key from marker",
+                            uuid=uuid,
+                            s3_zip_key=s3_zip_key,
+                            local_series_folder=cd.local_series_folder)
+                    else:
+                        logger.error(
+                            "instance marked as local but file is gone and no S3 key available. "
+                            "DATA LOSS: this instance cannot be retrieved.",
+                            uuid=uuid,
+                            local_series_folder=cd.local_series_folder)
+                        return orthanc.ErrorCode.UNKNOWN_RESOURCE, None
 
-            logger.debug("instance not in local cache, retrieving series from S3",
-                         uuid=uuid,
-                         s3_zip_key=s3_zip_key,
-                         local_series_folder=cd.local_series_folder)
-            logger.debug("calling zip_manager.retrieve_zip_from_s3()", uuid=uuid, s3_zip_key=s3_zip_key)
-            self._zip_manager.retrieve_zip_from_s3(s3_zip_key=s3_zip_key,
-                                                   local_series_folder=cd.local_series_folder)
-            logger.debug("zip_manager.retrieve_zip_from_s3() returned", uuid=uuid)
-            logger.debug("series retrieved from S3 into local cache",
-                         uuid=uuid,
-                         s3_zip_key=s3_zip_key)
-        else:
-            logger.debug("instance found in local cache",
-                         uuid=uuid,
-                         local_series_folder=cd.local_series_folder)
+                logger.debug("instance not in local cache, retrieving series from S3",
+                             uuid=uuid,
+                             s3_zip_key=s3_zip_key,
+                             local_series_folder=cd.local_series_folder)
+                logger.debug("calling zip_manager.retrieve_zip_from_s3()", uuid=uuid, s3_zip_key=s3_zip_key)
+                self._zip_manager.retrieve_zip_from_s3(s3_zip_key=s3_zip_key,
+                                                       local_series_folder=cd.local_series_folder)
+                logger.debug("zip_manager.retrieve_zip_from_s3() returned", uuid=uuid)
+                logger.debug("series retrieved from S3 into local cache",
+                             uuid=uuid,
+                             s3_zip_key=s3_zip_key)
+            else:
+                logger.debug("instance found in local cache",
+                             uuid=uuid,
+                             local_series_folder=cd.local_series_folder)
 
-        # make sure the file is in the local storage (this is a blocking call)
-        # TODO
-
-        # if custom_data and len(custom_data):
-        #     custom_data = json.loads(custom_data.decode('utf-8'))
-        logger.debug("calling local_storage.read_range()", uuid=uuid, range_start=range_start, size=size)
-        result = self._local_storage.read_range(uuid=uuid,
-                                                local_series_folder=cd.local_series_folder,
-                                                content_type=content_type,
-                                                range_start=range_start,
-                                                size=size)
-        logger.debug("local_storage.read_range() returned", uuid=uuid)
+            logger.debug("calling local_storage.read_range()", uuid=uuid, range_start=range_start, size=size)
+            result = self._local_storage.read_range(uuid=uuid,
+                                                    local_series_folder=cd.local_series_folder,
+                                                    content_type=content_type,
+                                                    range_start=range_start,
+                                                    size=size)
+            logger.debug("local_storage.read_range() returned", uuid=uuid)
 
         error_code, data = result
         logger.debug("storage_read_range completed",
