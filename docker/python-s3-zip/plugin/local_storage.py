@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 import orthanc
@@ -6,11 +8,14 @@ import threading
 import subprocess
 import queue
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Tuple, Optional
+from typing import Any, Callable, ClassVar, Dict, Iterator, List, Optional, Tuple
 from local_storage_interface import LocalStorageInterface
 from collections import deque
 from s3zip_logging import get_logger
+
+FolderStatEntry = Tuple[float, str, int]
 
 
 @dataclass
@@ -44,9 +49,9 @@ logger = get_logger(__name__)
 #   S3ZIP_LOCAL_STORAGE_LOG_LEVEL: DEBUG
 # ---------------------------------------------------------------------------
 _LOCAL_STORAGE_LOG_LEVEL_ENV_VAR = "S3ZIP_LOCAL_STORAGE_LOG_LEVEL"
-_module_level_override = os.environ.get(_LOCAL_STORAGE_LOG_LEVEL_ENV_VAR)
+_module_level_override: Optional[str] = os.environ.get(_LOCAL_STORAGE_LOG_LEVEL_ENV_VAR)
 if _module_level_override:
-    _lvl = getattr(logging, _module_level_override.upper(), None)
+    _lvl: Any = getattr(logging, _module_level_override.upper(), None)
     if _lvl is not None:
         # Set the level on this module's logger so isEnabledFor() returns True for
         # records at the override level.
@@ -60,7 +65,7 @@ if _module_level_override:
         # and replaced by the root-logger handler (level=NOTSET=0), so this adjustment is
         # only relevant during the import-time window and in standalone setups that never
         # call inject_logger_factory().
-        _s3zip_root = logging.getLogger("s3zip")
+        _s3zip_root: logging.Logger = logging.getLogger("s3zip")
         for _h in _s3zip_root.handlers:
             if _lvl < _h.level:
                 _h.setLevel(_lvl)
@@ -85,13 +90,25 @@ class LocalStorage(LocalStorageInterface):
     _available_size: int
     _block_size: int
     _lock: threading.RLock
-    _folder_stats: queue.PriorityQueue
-    _is_folder_safe_to_evict: Optional[Callable[[str], bool]]
+    _io_condition: threading.Condition
+    _active_writers: int
+    _scan_in_progress: bool
+    _reserved_bytes: int
+    _folder_lease_counts: dict[str, int]
+    _folder_marker_cs_locks: dict[str, tuple[threading.Lock, int]]
+    _folder_stats: queue.PriorityQueue[FolderStatEntry]
+    _is_folder_safe_to_evict: Callable[[str], bool] | None
 
-    def __init__(self, root: str, max_size_mb: int):
+    def __init__(self, root: str, max_size_mb: int) -> None:
         self._root = root
         self._max_size = max_size_mb * 1024 * 1024
         self._lock = threading.RLock()
+        self._io_condition = threading.Condition()
+        self._active_writers = 0
+        self._scan_in_progress = False
+        self._reserved_bytes = 0
+        self._folder_lease_counts = {}
+        self._folder_marker_cs_locks = {}
         self._is_folder_safe_to_evict = None
 
         self._update_local_storage_stats()
@@ -101,7 +118,7 @@ class LocalStorage(LocalStorageInterface):
                      max_size_mb=max_size_mb,
                      max_size_bytes=self._max_size)
 
-    def set_eviction_guard(self, is_folder_safe_to_evict: callable):
+    def set_eviction_guard(self, is_folder_safe_to_evict: Callable[[str], bool]) -> None:
         """
         - Set a callback that determines if a local series folder is safe to evict.
         - The callback receives the folder name (not the full path) and
@@ -110,29 +127,162 @@ class LocalStorage(LocalStorageInterface):
         """
         self._is_folder_safe_to_evict = is_folder_safe_to_evict
 
-    def _update_local_storage_stats(self):
+    @contextmanager
+    def lease_folder(self, local_series_folder: str) -> Iterator[None]:
+        """Keep a series folder stable while a caller depends on its contents.
+
+        Eviction removes whole series folders. A caller that checks a file path
+        and then opens it, or extracts several files into the same folder, needs
+        the folder to remain present for the full operation rather than only for
+        one filesystem call. The lease is a refcount checked by eviction; it is
+        not a global I/O mutex.
+        """
+        self._acquire_folder_lease(local_series_folder)
+        try:
+            yield
+        finally:
+            self._release_folder_lease(local_series_folder)
+
+    def _acquire_folder_lease(self, local_series_folder: str) -> None:
         with self._lock:
-            prev_available = getattr(self, '_available_size', None)
-            self._available_size = self._max_size
-            self._block_size = os.statvfs(self._root).f_frsize
+            self._folder_lease_counts[local_series_folder] = (
+                self._folder_lease_counts.get(local_series_folder, 0) + 1
+            )
+            logger.debug(
+                "LocalStorage: folder lease acquired",
+                local_series_folder=local_series_folder,
+                lease_count=self._folder_lease_counts[local_series_folder],
+            )
 
-            self._folder_stats = queue.PriorityQueue()
+    def _release_folder_lease(self, local_series_folder: str) -> None:
+        with self._lock:
+            lease_count = self._folder_lease_counts.get(local_series_folder, 0)
+            if lease_count <= 1:
+                self._folder_lease_counts.pop(local_series_folder, None)
+                lease_count = 0
+            else:
+                lease_count -= 1
+                self._folder_lease_counts[local_series_folder] = lease_count
+            logger.debug(
+                "LocalStorage: folder lease released",
+                local_series_folder=local_series_folder,
+                lease_count=lease_count,
+            )
 
-            cmd = ["du", "-b", "--max-depth=1", self._root]
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            lines = result.stdout.strip().split("\n")
+    def _get_folder_lease_count(self, local_series_folder: str) -> int:
+        return self._folder_lease_counts.get(local_series_folder, 0)
 
-            total_folders = 0
-            total_apparent_bytes = 0
-            for line in lines:
-                size_str, path = line.split("\t")
-                folder_size = int(size_str)
-                if path != self._root:
-                    last_modified = os.path.getmtime(path)
-                    self._available_size -= folder_size
-                    self._folder_stats.put((last_modified, path, folder_size))
-                    total_folders += 1
-                    total_apparent_bytes += folder_size
+    @contextmanager
+    def folder_marker_critical_section(self, local_series_folder: str) -> Iterator[None]:
+        """Per-folder mutex for marker publish/invalidate operations.
+
+        Two paths race for the marker file: ``copy_series_to_s3`` writes it
+        after a final attachment-set recheck, and ``storage_create`` deletes
+        it whenever a new instance lands on disk. Without serialization, the
+        copy can publish a marker AFTER the create's delete has already run
+        as a no-op, leaving a stale marker that hides an un-uploaded file.
+
+        Acquiring is refcounted: the underlying ``threading.Lock`` is created
+        lazily on first use and removed from the dict when no thread is in
+        the section, so memory does not grow with the lifetime catalogue of
+        series folders.
+        """
+        lock = self._acquire_folder_marker_cs(local_series_folder)
+        try:
+            with lock:
+                yield
+        finally:
+            self._release_folder_marker_cs(local_series_folder)
+
+    def _acquire_folder_marker_cs(self, local_series_folder: str) -> threading.Lock:
+        with self._lock:
+            entry = self._folder_marker_cs_locks.get(local_series_folder)
+            if entry is None:
+                new_lock = threading.Lock()
+                self._folder_marker_cs_locks[local_series_folder] = (new_lock, 1)
+                return new_lock
+            existing_lock, count = entry
+            self._folder_marker_cs_locks[local_series_folder] = (existing_lock, count + 1)
+            return existing_lock
+
+    def _release_folder_marker_cs(self, local_series_folder: str) -> None:
+        with self._lock:
+            entry = self._folder_marker_cs_locks.get(local_series_folder)
+            if entry is None:
+                return
+            existing_lock, count = entry
+            if count <= 1:
+                del self._folder_marker_cs_locks[local_series_folder]
+            else:
+                self._folder_marker_cs_locks[local_series_folder] = (existing_lock, count - 1)
+
+    def _update_local_storage_stats(self) -> None:
+        self._pause_writes_for_scan()
+        try:
+            self._update_local_storage_stats_with_writes_paused()
+        finally:
+            self._resume_writes_after_scan()
+
+    def _pause_writes_for_scan(self) -> None:
+        # A scan must not overlap physical writes: otherwise `du` can see a
+        # finished write while the reservation still counts it as in-flight.
+        with self._io_condition:
+            while self._scan_in_progress:
+                self._io_condition.wait()
+            self._scan_in_progress = True
+            # If wait() is interrupted (e.g. by a signal) after we have already
+            # claimed the scan slot, we must clear the flag and wake any other
+            # blocked threads. Otherwise _scan_in_progress stays True forever
+            # and every subsequent _enter_write / scan-pauser deadlocks.
+            try:
+                while self._active_writers > 0:
+                    self._io_condition.wait()
+            except BaseException:
+                self._scan_in_progress = False
+                self._io_condition.notify_all()
+                raise
+
+    def _resume_writes_after_scan(self) -> None:
+        with self._io_condition:
+            self._scan_in_progress = False
+            self._io_condition.notify_all()
+
+    def _enter_write(self) -> None:
+        with self._io_condition:
+            while self._scan_in_progress:
+                self._io_condition.wait()
+            self._active_writers += 1
+
+    def _exit_write(self) -> None:
+        with self._io_condition:
+            self._active_writers -= 1
+            if self._active_writers == 0:
+                self._io_condition.notify_all()
+
+    def _update_local_storage_stats_with_writes_paused(self) -> None:
+        block_size: int = os.statvfs(self._root).f_frsize
+        folder_stats: queue.PriorityQueue[FolderStatEntry] = queue.PriorityQueue()
+
+        cmd: List[str] = ["du", "-b", "--max-depth=1", self._root]
+        result: subprocess.CompletedProcess[str] = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        lines: List[str] = result.stdout.strip().split("\n")
+
+        total_folders: int = 0
+        total_apparent_bytes: int = 0
+        for line in lines:
+            size_str, path = line.split("\t")
+            folder_size: int = int(size_str)
+            if path != self._root:
+                last_modified: float = os.path.getmtime(path)
+                folder_stats.put((last_modified, path, folder_size))
+                total_folders += 1
+                total_apparent_bytes += folder_size
+
+        with self._lock:
+            prev_available: Optional[int] = getattr(self, '_available_size', None)
+            self._block_size = block_size
+            self._folder_stats = folder_stats
+            self._available_size = self._max_size - total_apparent_bytes - self._reserved_bytes
 
             logger.debug(
                 "LocalStorage: disk stats refreshed",
@@ -142,6 +292,8 @@ class LocalStorage(LocalStorageInterface):
                 total_folders=total_folders,
                 total_apparent_bytes=total_apparent_bytes,
                 total_apparent_mb=round(total_apparent_bytes / (1024 * 1024), 2),
+                reserved_bytes=self._reserved_bytes,
+                reserved_mb=round(self._reserved_bytes / (1024 * 1024), 2),
                 available_bytes=self._available_size,
                 available_mb=round(self._available_size / (1024 * 1024), 2),
                 prev_available_bytes=prev_available,
@@ -151,7 +303,8 @@ class LocalStorage(LocalStorageInterface):
     def _evict_until(self, target_available_bytes: Optional[int]) -> EvictionResult:
         """Evict oldest-first folders until ``self._available_size`` reaches the target.
 
-        Caller MUST hold ``self._lock`` and MUST have refreshed
+        Caller MUST hold ``self._lock`` and MUST have paused writes via
+        ``_pause_writes_for_scan``. Caller also MUST have refreshed
         ``self._folder_stats`` (e.g. via ``_update_local_storage_stats``)
         before calling: this method neither acquires the lock nor refreshes
         the queue.
@@ -162,14 +315,15 @@ class LocalStorage(LocalStorageInterface):
                 ``None`` to drain the LRU queue completely (i.e. evict
                 everything that the eviction guard considers safe to evict).
 
-        Folders without a ``.s3-uploaded`` marker are protected by the
-        eviction guard set via ``set_eviction_guard`` and are skipped, then
-        put back into the queue at the end so they remain candidates for
-        future eviction.
+        Folders with active leases are skipped because another thread is using
+        their contents across multiple filesystem calls. Folders without a
+        ``.s3-uploaded`` marker are protected by the eviction guard set via
+        ``set_eviction_guard``. Skipped folders are put back into the queue so
+        they remain candidates for future eviction.
         """
-        skipped = []
-        freed_bytes = 0
-        freed_folders = 0
+        skipped: List[FolderStatEntry] = []
+        freed_bytes: int = 0
+        freed_folders: int = 0
 
         def _need_more() -> bool:
             if target_available_bytes is None:
@@ -177,10 +331,19 @@ class LocalStorage(LocalStorageInterface):
             return self._available_size < target_available_bytes
 
         while _need_more() and not self._folder_stats.empty():
-            entry = self._folder_stats.get()
+            entry: FolderStatEntry = self._folder_stats.get()
             _, path, folder_size = entry
 
-            folder_name = os.path.basename(path)
+            folder_name: str = os.path.basename(path)
+            lease_count = self._get_folder_lease_count(folder_name)
+            if lease_count > 0:
+                logger.info(
+                    "LocalStorage: skipping eviction of leased folder",
+                    folder=folder_name,
+                    folder_size=folder_size,
+                    lease_count=lease_count)
+                skipped.append(entry)
+                continue
 
             if self._is_folder_safe_to_evict is not None:
                 try:
@@ -205,10 +368,23 @@ class LocalStorage(LocalStorageInterface):
                 available_before=self._available_size,
             )
 
-            # TODO: handle errors here (e.g. if the file gets locked by
-            # another process, or if it is being deleted by someone trying
-            # to help! Unlikely but what can go wrong will go wrong...)
-            shutil.rmtree(path)
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                logger.info(
+                    "LocalStorage: folder already gone during eviction",
+                    folder=folder_name,
+                    folder_size=folder_size,
+                )
+            except OSError as e:
+                logger.warning(
+                    "LocalStorage: failed to evict folder, leaving it queued for a future pass",
+                    folder=folder_name,
+                    folder_size=folder_size,
+                    error=str(e),
+                )
+                skipped.append(entry)
+                continue
             self._available_size += folder_size
             freed_bytes += folder_size
             freed_folders += 1
@@ -231,68 +407,126 @@ class LocalStorage(LocalStorageInterface):
             available_bytes_after=self._available_size,
         )
 
-    def _make_room(self, size: int):
+    def _make_room(self, size: int) -> int:
+        reservation_size: int = max(size, 0)
+
         with self._lock:
-            estimated_disk_size = ((size + self._block_size - 1) // self._block_size) * self._block_size
+            self._available_size -= reservation_size
+            self._reserved_bytes += reservation_size
 
             logger.debug(
                 "LocalStorage: _make_room called",
                 requested_bytes=size,
-                estimated_disk_bytes=estimated_disk_size,
+                reservation_bytes=reservation_size,
+                reserved_bytes=self._reserved_bytes,
                 current_available_bytes=self._available_size,
                 current_available_mb=round(self._available_size / (1024 * 1024), 2),
             )
 
-            if estimated_disk_size < self._available_size:
-                self._available_size -= estimated_disk_size
+            if self._available_size >= 0:
                 logger.debug(
                     "LocalStorage: fast path - sufficient space, no eviction needed",
                     available_after_bytes=self._available_size,
                     available_after_mb=round(self._available_size / (1024 * 1024), 2),
+                    reserved_bytes=self._reserved_bytes,
                 )
-                return
+                return reservation_size
 
             logger.debug(
                 "LocalStorage: slow path - available space insufficient, refreshing disk stats",
-                estimated_disk_bytes=estimated_disk_size,
+                reservation_bytes=reservation_size,
                 available_before_refresh_bytes=self._available_size,
+                reserved_bytes=self._reserved_bytes,
             )
-            self._update_local_storage_stats()
+
+        scan_paused = False
+        try:
+            self._pause_writes_for_scan()
+            scan_paused = True
+            self._update_local_storage_stats_with_writes_paused()
 
             logger.debug(
                 "LocalStorage: disk stats refreshed, starting eviction loop",
-                estimated_disk_bytes=estimated_disk_size,
-                available_after_refresh_bytes=self._available_size,
-                folders_queued=self._folder_stats.qsize(),
+                reservation_bytes=reservation_size,
             )
 
-            # Reclaim space -- evict oldest folders first, but protect folders
-            # whose data has not yet been safely backed up to S3.
-            # This can be useful if the plugin receives a burst of uploads that
-            # exceed the local storage capacity, but the S3 upload process is
-            # still catching up
-            result = self._evict_until(target_available_bytes=estimated_disk_size)
-
-            logger.debug(
-                "LocalStorage: eviction loop complete",
-                freed_folders=result.freed_folders,
-                freed_bytes=result.freed_bytes,
-                skipped_folders=result.skipped_folders,
-                estimated_disk_size=estimated_disk_size,
-                available_after_eviction_bytes=self._available_size,
-                available_after_eviction_mb=round(self._available_size / (1024 * 1024), 2),
-            )
-
-            if estimated_disk_size > self._available_size:
-                logger.warning(
-                    "LocalStorage: could not free enough space. "
-                    "Some folders are protected because they are not yet on S3.",
-                    needed=estimated_disk_size,
-                    available=self._available_size,
-                    available_mb=round(self._available_size / (1024 * 1024), 2),
-                    protected_folders=result.skipped_folders,
-                    max_size_mb=self._max_size // (1024 * 1024),
+            with self._lock:
+                logger.debug(
+                    "LocalStorage: starting eviction loop",
+                    reservation_bytes=reservation_size,
+                    available_after_refresh_bytes=self._available_size,
+                    reserved_bytes=self._reserved_bytes,
+                    folders_queued=self._folder_stats.qsize(),
                 )
+
+                # Reclaim space -- evict oldest folders first, but protect folders
+                # whose data has not yet been safely backed up to S3.
+                # This can be useful if the plugin receives a burst of uploads that
+                # exceed the local storage capacity, but the S3 upload process is
+                # still catching up
+                result = self._evict_until(target_available_bytes=0)
+
+                logger.debug(
+                    "LocalStorage: eviction loop complete",
+                    freed_folders=result.freed_folders,
+                    freed_bytes=result.freed_bytes,
+                    skipped_folders=result.skipped_folders,
+                    reservation_bytes=reservation_size,
+                    reserved_bytes=self._reserved_bytes,
+                    available_after_eviction_bytes=self._available_size,
+                    available_after_eviction_mb=round(self._available_size / (1024 * 1024), 2),
+                )
+
+                if self._available_size < 0:
+                    logger.warning(
+                        "LocalStorage: could not free enough space. "
+                        "Some folders are protected because they are not yet on S3.",
+                        needed=-self._available_size,
+                        available=self._available_size,
+                        available_mb=round(self._available_size / (1024 * 1024), 2),
+                        reserved_bytes=self._reserved_bytes,
+                        protected_folders=result.skipped_folders,
+                        max_size_mb=self._max_size // (1024 * 1024),
+                    )
+        except Exception:
+            self._rollback_write_reservation(reservation_size)
+            raise
+        finally:
+            if scan_paused:
+                self._resume_writes_after_scan()
+
+        return reservation_size
+
+    def _commit_write_reservation(self, reserved_bytes: int) -> None:
+        if reserved_bytes <= 0:
+            return
+
+        with self._lock:
+            self._reserved_bytes = max(0, self._reserved_bytes - reserved_bytes)
+            logger.debug(
+                "LocalStorage: write reservation committed",
+                released_reserved_bytes=reserved_bytes,
+                reserved_bytes=self._reserved_bytes,
+                available_bytes=self._available_size,
+            )
+
+    def _rollback_write_reservation(self, reserved_bytes: int) -> None:
+        if reserved_bytes <= 0:
+            return
+
+        with self._lock:
+            self._reserved_bytes = max(0, self._reserved_bytes - reserved_bytes)
+            self._available_size += reserved_bytes
+
+    def _touch_lru_reference(self, folder_path: str) -> None:
+        try:
+            os.utime(folder_path, None)
+        except OSError as e:
+            logger.debug(
+                "LocalStorage: failed to update folder LRU timestamp",
+                folder=folder_path,
+                error=str(e),
+            )
 
     def evict_all_safe(self) -> EvictionResult:
         """Force-evict every locally-cached series that has been safely uploaded to S3.
@@ -302,28 +536,33 @@ class LocalStorage(LocalStorageInterface):
         (``.s3-uploaded`` marker present) is removed from the local cache;
         folders still in flight are skipped and remain on disk.
 
-        Synchronous: holds ``self._lock`` for the entire pass, so concurrent
-        ``write_file`` / ``read_file`` calls are serialised behind it. The
-        cost is O(num_local_folders) ``shutil.rmtree`` calls plus one
+        Synchronous: pauses concurrent ``write_file`` disk writes during the
+        scan/eviction pass. The cost is O(num_local_folders) ``shutil.rmtree``
+        calls plus one
         ``du -b --max-depth=1`` invocation.
 
         Returns an ``EvictionResult`` describing what was freed.
         """
-        with self._lock:
-            self._update_local_storage_stats()
-            result = self._evict_until(target_available_bytes=None)
+        self._pause_writes_for_scan()
+        try:
+            self._update_local_storage_stats_with_writes_paused()
+            with self._lock:
+                result = self._evict_until(target_available_bytes=None)
 
-            logger.info(
-                "LocalStorage: evict_all_safe complete",
-                freed_folders=result.freed_folders,
-                freed_bytes=result.freed_bytes,
-                skipped_folders=result.skipped_folders,
-                available_after_bytes=self._available_size,
-                available_after_mb=round(self._available_size / (1024 * 1024), 2),
-            )
-            return result
+                logger.info(
+                    "LocalStorage: evict_all_safe complete",
+                    freed_folders=result.freed_folders,
+                    freed_bytes=result.freed_bytes,
+                    skipped_folders=result.skipped_folders,
+                    available_after_bytes=self._available_size,
+                    available_after_mb=round(self._available_size / (1024 * 1024), 2),
+                    reserved_bytes=self._reserved_bytes,
+                )
+                return result
+        finally:
+            self._resume_writes_after_scan()
 
-    def get_cache_summary(self, marker_filename: str = ".s3-uploaded") -> dict:
+    def get_cache_summary(self, marker_filename: str = ".s3-uploaded") -> Dict[str, int]:
         """Return a snapshot of local-cache occupancy.
 
         Refreshes the disk stats (does NOT evict) and walks the temp folder
@@ -332,14 +571,14 @@ class LocalStorage(LocalStorageInterface):
 
         The counts are advisory — they are racy with the upload thread.
         """
-        with self._lock:
-            self._update_local_storage_stats()
-            total_folders = self._folder_stats.qsize()
-            uploaded = 0
-            pending = 0
+        self._pause_writes_for_scan()
+        try:
+            self._update_local_storage_stats_with_writes_paused()
+            uploaded: int = 0
+            pending: int = 0
             try:
                 for name in os.listdir(self._root):
-                    folder = os.path.join(self._root, name)
+                    folder: str = os.path.join(self._root, name)
                     if not os.path.isdir(folder):
                         continue
                     if os.path.exists(os.path.join(folder, marker_filename)):
@@ -348,31 +587,57 @@ class LocalStorage(LocalStorageInterface):
                         pending += 1
             except FileNotFoundError:
                 pass
-            used_bytes = self._max_size - self._available_size
-            return {
-                "max_bytes": self._max_size,
-                "available_bytes": self._available_size,
-                "used_bytes": used_bytes,
-                "total_folders": total_folders,
-                "folders_on_s3": uploaded,
-                "folders_not_on_s3": pending,
-            }
+            with self._lock:
+                total_folders: int = self._folder_stats.qsize()
+                used_bytes: int = self._max_size - self._available_size
+                return {
+                    "max_bytes": self._max_size,
+                    "available_bytes": self._available_size,
+                    "used_bytes": used_bytes,
+                    "reserved_bytes": self._reserved_bytes,
+                    "total_folders": total_folders,
+                    "folders_on_s3": uploaded,
+                    "folders_not_on_s3": pending,
+                }
+        finally:
+            self._resume_writes_after_scan()
 
 
-    def write_file(self, local_series_folder: str, uuid: str, content: bytes):
-        self._make_room(len(content))
+    def write_file(self, local_series_folder: str, uuid: str, content: bytes) -> None:
+        reserved_bytes: int = self._make_room(len(content))
+        write_failed: bool = False
 
-        self._write_file(uuid=uuid,
-                         local_series_folder=local_series_folder,
-                         content_type=orthanc.ContentType.DICOM,
-                         content=content)
+        self._enter_write()
+        try:
+            try:
+                self._write_file(uuid=uuid,
+                                 local_series_folder=local_series_folder,
+                                 content_type=orthanc.ContentType.DICOM,
+                                 content=content)
+            except Exception:
+                write_failed = True
+                self._rollback_write_reservation(reserved_bytes)
+                raise
+            else:
+                self._commit_write_reservation(reserved_bytes)
+        finally:
+            self._exit_write()
+            if write_failed:
+                try:
+                    self._update_local_storage_stats()
+                except Exception as e:
+                    logger.warning(
+                        "LocalStorage: failed to refresh stats after write failure; restored reservation optimistically",
+                        released_reserved_bytes=reserved_bytes,
+                        error=str(e),
+                    )
 
 
-    def _write_file(self, uuid: str, local_series_folder: str, content_type: orthanc.ContentType, content: bytes):
+    def _write_file(self, uuid: str, local_series_folder: str, content_type: orthanc.ContentType, content: bytes) -> None:
 
-        path = self.get_local_path(uuid=uuid,
-                                   local_series_folder=local_series_folder,
-                                   content_type=content_type)
+        path: str = self.get_local_path(uuid=uuid,
+                                        local_series_folder=local_series_folder,
+                                        content_type=content_type)
 
         logger.debug("writing file to local storage",
                      uuid=uuid,
@@ -385,9 +650,7 @@ class LocalStorage(LocalStorageInterface):
         with open(path, "wb") as f:
             f.write(content)
 
-        # with self._lock:
-
-        # TODO: increment used_size + LRU references
+        self._touch_lru_reference(os.path.dirname(path))
 
         logger.debug("file written to local storage",
                      uuid=uuid,
@@ -409,9 +672,9 @@ class LocalStorage(LocalStorageInterface):
                    range_start: int,
                    size: int) -> bytes:
 
-        path = self.get_local_path(uuid=uuid,
-                                   local_series_folder=local_series_folder,
-                                   content_type=content_type)
+        path: str = self.get_local_path(uuid=uuid,
+                                        local_series_folder=local_series_folder,
+                                        content_type=content_type)
 
         logger.debug("reading file from local storage",
                      uuid=uuid,
@@ -424,7 +687,7 @@ class LocalStorage(LocalStorageInterface):
                 f.seek(range_start)
 
             if size > 0:
-                data = f.read(size)
+                data: bytes = f.read(size)
             else:
                 data = f.read()
 
@@ -436,7 +699,7 @@ class LocalStorage(LocalStorageInterface):
         return data
 
 
-    SUPPORTED_CONTENT_TYPES = (orthanc.ContentType.DICOM, orthanc.ContentType.DICOM_UNTIL_PIXEL_DATA)
+    SUPPORTED_CONTENT_TYPES: ClassVar[Tuple[orthanc.ContentType, ...]] = (orthanc.ContentType.DICOM, orthanc.ContentType.DICOM_UNTIL_PIXEL_DATA)
 
     def create(self,
                uuid: str,
@@ -490,11 +753,11 @@ class LocalStorage(LocalStorageInterface):
                      size=size)
 
         try:
-            data = self._read_file(uuid=uuid,
-                                   local_series_folder=local_series_folder,
-                                   content_type=content_type,
-                                   range_start=range_start,
-                                   size=size)
+            data: bytes = self._read_file(uuid=uuid,
+                                          local_series_folder=local_series_folder,
+                                          content_type=content_type,
+                                          range_start=range_start,
+                                          size=size)
 
             logger.debug("read_range succeeded",
                          uuid=uuid,
@@ -517,18 +780,22 @@ class LocalStorage(LocalStorageInterface):
     def remove(self,
                uuid: str,
                local_series_folder: str,
-               content_type: orthanc.ContentType):
+               content_type: orthanc.ContentType) -> None:
 
         # TODO: we should probably implement an asynchronous file deleter
 
-        path = self.get_local_path(uuid=uuid,
-                                   local_series_folder=local_series_folder,
-                                   content_type=content_type)
+        path: str = self.get_local_path(uuid=uuid,
+                                        local_series_folder=local_series_folder,
+                                        content_type=content_type)
 
-        existed = os.path.exists(path)
-
-        if existed:
+        # os.path.exists() + os.remove() is not atomic: eviction can rmtree
+        # the parent folder between the two calls. Catch FileNotFoundError
+        # rather than letting it surface as a storage callback error.
+        try:
             os.remove(path)
+            existed: bool = True
+        except FileNotFoundError:
+            existed = False
 
         logger.debug("remove called",
                      uuid=uuid,
@@ -548,10 +815,10 @@ class LocalStorage(LocalStorageInterface):
         return os.path.join(self._root, local_series_folder)
 
     def has_local_file(self, uuid: str, local_series_folder: str, content_type: orthanc.ContentType) -> bool:
-        path = self.get_local_path(uuid=uuid,
-                                   local_series_folder=local_series_folder,
-                                   content_type=content_type)
-        exists = os.path.exists(path)
+        path: str = self.get_local_path(uuid=uuid,
+                                        local_series_folder=local_series_folder,
+                                        content_type=content_type)
+        exists: bool = os.path.exists(path)
 
         logger.debug("has_local_file check",
                      uuid=uuid,

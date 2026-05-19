@@ -25,7 +25,7 @@ ANSI_COLORS = [
 ]
 ANSI_RESET = '\033[0m'
 
-compose_dir = os.path.dirname(os.path.abspath(__file__))
+compose_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 docker = DockerClient(compose_project_directory=compose_dir)
 
 _log_thread = None

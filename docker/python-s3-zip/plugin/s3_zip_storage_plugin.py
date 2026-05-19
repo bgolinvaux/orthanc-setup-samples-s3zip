@@ -6,6 +6,11 @@ import boto3
 import uuid as uuid_module
 from typing import Tuple, Optional
 from s3_zip_storage import S3ZipStorage
+from local_to_s3_zip_manager import (
+    DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
+    DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
+    DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
+)
 from s3zip_logging import get_logger
 
 # This file contains a wrapper to facilitate the installation of the S3ZipStorage.
@@ -17,6 +22,7 @@ logger.debug("s3_zip_storage_plugin module loaded")
 
 storage_singleton: Optional[S3ZipStorage] = None
 
+DEFAULT_MAX_LOCAL_STORAGE_SIZE_MB: float = 30720
 
 def _storage_create(uuid: str,
                     content_type: orthanc.ContentType,
@@ -135,7 +141,7 @@ def on_rest_api_series_s3_status(output, uri, **request):  # GET -> returns a st
             logger.error("Failed to retrieve series status", series_id)
             output.SendHttpStatusCode(400)
             return
-        
+
         status = {
             'is-stored-in-s3': series_status.is_stored_in_s3,
             's3-zip-key': series_status.s3_zip_key
@@ -162,7 +168,7 @@ def on_rest_api_series_s3_archive(output, uri, **request): # GET -> streams a zi
             while True:
                 chunk = zip_stream.read(64*1024)
                 if not chunk:
-                    return                
+                    return
 
                 output.SendStreamChunk(chunk)
         else:
@@ -343,8 +349,29 @@ def register_s3_zip_storage_plugin():
     if "LocalStorageMaxSizeMB" in s3_zip_config:
         max_local_storage_size_mb = int(s3_zip_config.get("LocalStorageMaxSizeMB"))
     else:
-        max_local_storage_size_mb = 1024
+        max_local_storage_size_mb = DEFAULT_MAX_LOCAL_STORAGE_SIZE_MB
+
+    s3_retrieval_max_attempts = int(
+        s3_zip_config.get("S3RetrievalMaxAttempts", DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS)
+    )
+    s3_retrieval_retry_base_delay_sec = float(
+        s3_zip_config.get(
+            "S3RetrievalRetryBaseDelaySeconds",
+            DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
+        )
+    )
+    s3_retrieval_retry_max_delay_sec = float(
+        s3_zip_config.get(
+            "S3RetrievalRetryMaxDelaySeconds",
+            DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
+        )
+    )
+
     logger.debug("compression setting resolved", enable_compression=enable_compression)
+    logger.debug("S3 retrieval retry settings resolved",
+                 s3_retrieval_max_attempts=s3_retrieval_max_attempts,
+                 s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
+                 s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec)
 
     key_prefix = s3_zip_config.get("PrefixKey", "").strip('/')
     logger.debug("key prefix resolved", key_prefix=key_prefix or "<none>")
@@ -354,7 +381,10 @@ def register_s3_zip_storage_plugin():
                                      s3_client=s3_client,
                                      bucket_name=bucket_name,
                                      enable_compression=enable_compression,
-                                     key_prefix=key_prefix)
+                                     key_prefix=key_prefix,
+                                     s3_retrieval_max_attempts=s3_retrieval_max_attempts,
+                                     s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
+                                     s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec)
 
     logger.info("registering storage area callbacks with Orthanc (RegisterStorageArea3)")
     logger.debug("calling orthanc.RegisterStorageArea3()")
@@ -375,7 +405,10 @@ def register_s3_zip_storage_plugin():
                 region=s3_zip_config.get("Region"),
                 temp_folder=s3_temp_folder_root,
                 compression=enable_compression,
-                key_prefix=key_prefix or "<none>")
+                key_prefix=key_prefix or "<none>",
+                s3_retrieval_max_attempts=s3_retrieval_max_attempts,
+                s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
+                s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec)
 
     # Failsafe: bypass logging framework entirely so this is always visible
     print(f"[s3zip] storage plugin registered | bucket={bucket_name} "
