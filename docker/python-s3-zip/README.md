@@ -13,7 +13,7 @@ To run the setup:
 
 ```
 docker pull orthancteam/orthanc-pre-release:master-unstable
-uv run test-scenario.py
+uv run ./tests/test_scenario.py
 ```
 
 The test scenario:
@@ -28,8 +28,6 @@ The test scenario:
 
 TODO/To discuss:
 - series deletions (delete local files + delete zip files in S3 (on DELETED_SERIES event ?)).  This should not be required since we want to keep both the source and the anonymized studies
-- more error handling
-- use the s3 multipart upload (or transfer mode)
 
 Done:
 - use a queue to perform `move_series_to_s3` asynchronously

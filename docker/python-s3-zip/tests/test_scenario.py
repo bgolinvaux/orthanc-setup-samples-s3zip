@@ -9,6 +9,8 @@ import boto3
 import sys
 import os
 import threading
+import hashlib
+import pprint
 from contextlib import contextmanager
 from python_on_whales import DockerClient
 
@@ -26,6 +28,7 @@ ANSI_COLORS = [
 ANSI_RESET = '\033[0m'
 
 compose_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+local_tmp_storage_dir = os.path.join(compose_dir, "tmp-local-storage")
 docker = DockerClient(compose_project_directory=compose_dir)
 
 _log_thread = None
@@ -107,6 +110,13 @@ def get_zip_size_on_s3(series_id: str):
     response = s3_client.head_object(Bucket="zip-bucket", Key=f"orthanc-zips/{series_id}.zip")
     return response['ContentLength']
 
+def get_series_hash(patient_id: str, study_uid: str, series_uid: str) -> str:
+    combined_id = f"{patient_id}|{study_uid}|{series_uid}"
+    series_hash = hashlib.sha1(combined_id.encode('utf-8')).hexdigest()
+
+    return series_hash
+
+
 # --- Test scenario ---
 
 compose_up()
@@ -122,6 +132,74 @@ print("Cleaning default Orthanc")
 default_orthanc.delete_all_content()
 print("Cleaning zip Orthanc")
 zip_orthanc.delete_all_content()
+
+
+print("---------------- Test Deletion on zip Orthanc ----------------")
+zip_orthanc.post("/s3-zip/local-cache/evict-all")
+zip_populator = OrthancTestDbPopulator(api_client=zip_orthanc,
+                                       studies_count=1,
+                                       series_count=1,
+                                       instances_count=100,
+                                       worker_threads_count=5)
+zip_populator.execute()
+series_id = zip_orthanc.series.get_all_ids()[0]
+all_instances_ids = zip_orthanc.instances.get_all_ids()
+first_instance_tags = zip_orthanc.instances.get_tags(all_instances_ids[0]) # get_json(endpoint=f"instances/{all_instances_ids[0]}/attachments/dicom/info")
+local_series_folder = get_series_hash(patient_id=first_instance_tags.get("PatientID"),
+                                      study_uid=first_instance_tags.get("StudyInstanceUID"),
+                                      series_uid=first_instance_tags.get("SeriesInstanceUID"))
+
+print("Deleting 10 instances before the series is uploaded to s3")  # Note: deleting an instance won't delay the StableSeries event
+for i in all_instances_ids[:10]:
+    zip_orthanc.instances.delete(i)
+
+# count the number of files in the tmp-local-storage (it should be 100 - 10 = 90; the .s3-uploaded file should not be there yet)
+file_count = len([f for f in os.listdir(os.path.join(local_tmp_storage_dir, local_series_folder))])
+if file_count != 90:
+    print(f"Found {file_count} files in local folder instead of 90")
+    exit(-21)
+
+print("Waiting until zip file is found on S3 (as seen from the zip Orthanc)...")
+if not wait_until(lambda: zip_orthanc.get_json(endpoint=f'series/{series_id}/s3-zip/status').get('is-stored-in-s3'),
+                  timeout=10,
+                  polling_interval=1):
+    print("is-stored-in-s3 should be True within 10 seconds after the upload")
+    exit(-22)
+
+print("Deleting 10 more instances now that the series is uploaded to s3")
+for i in all_instances_ids[10:20]:
+    zip_orthanc.instances.delete(i)
+
+# count the number of files in the tmp-local-storage (it should be 90 - 10 + 1 = 81; the .s3-uploaded file should now be there !)
+file_count = len([f for f in os.listdir(os.path.join(local_tmp_storage_dir, local_series_folder))]) - 1
+if file_count != 80:
+    print(f"Found {file_count} files in local folder instead of 80")
+    exit(-23)
+# note: at this point, the zip on s3 still contains 90 files but there's "nothgin" we can do about it !!
+
+# pprint.pprint(zip_orthanc.get_json("/s3-zip/local-cache/stats"))
+
+# now delete the series completely
+print("Deleting the series completely")
+zip_orthanc.series.delete(series_id)
+
+file_count = len([f for f in os.listdir(os.path.join(local_tmp_storage_dir, local_series_folder))]) - 1  # right now, the .s3-uploaded file remains
+if file_count != 0:
+    print(f"Found {file_count} files in local folder instead of 0")
+    exit(-24)
+
+stats = zip_orthanc.get_json("/s3-zip/local-cache/stats")
+if stats.get('total_folders') != 1:
+    print(f"Only one folder should remain in the tmp local storage; found {stats.get('total_folders')}")
+    exit(-25)
+
+if stats.get('used_bytes') > 100:
+    print(f"Only one .s3-uploaded file should remain found {stats.get('used_bytes')} byte remaining")
+    exit(-26)
+
+exit(0)
+
+print("---------------- Test Deletion on zip Orthanc - done ----------------")
 
 
 print("---------------- Test new API routes on zip Orthanc ----------------")

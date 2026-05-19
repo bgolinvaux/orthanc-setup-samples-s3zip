@@ -782,25 +782,28 @@ class LocalStorage(LocalStorageInterface):
                local_series_folder: str,
                content_type: orthanc.ContentType) -> None:
 
-        # TODO: we should probably implement an asynchronous file deleter
+        # Note: if it appears that deletions are too slow, we should implement an asynchronous file deleter.
 
-        path: str = self.get_local_path(uuid=uuid,
-                                        local_series_folder=local_series_folder,
-                                        content_type=content_type)
+        with self.lease_folder(local_series_folder=local_series_folder):
+            path: str = self.get_local_path(uuid=uuid,
+                                            local_series_folder=local_series_folder,
+                                            content_type=content_type)
 
-        # os.path.exists() + os.remove() is not atomic: eviction can rmtree
-        # the parent folder between the two calls. Catch FileNotFoundError
-        # rather than letting it surface as a storage callback error.
-        try:
-            os.remove(path)
-            existed: bool = True
-        except FileNotFoundError:
-            existed = False
+            # os.path.exists() + os.remove() is not atomic: eviction can rmtree
+            # the parent folder between the two calls. Catch FileNotFoundError
+            # rather than letting it surface as a storage callback error.
+            try:
+                file_size = os.path.getsize(path)   # Note: if it appears it is too slow, we could store the file_size in the CustomData
+                os.remove(path)
+                existed: bool = True
+                self._rollback_write_reservation(file_size)
+            except FileNotFoundError:
+                existed = False
 
-        logger.debug("remove called",
-                     uuid=uuid,
-                     path=path,
-                     existed=existed)
+            logger.debug("remove called",
+                        uuid=uuid,
+                        path=path,
+                        existed=existed)
 
 
     def get_local_path(self, uuid: str, local_series_folder: str, content_type: orthanc.ContentType) -> str:
