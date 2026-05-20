@@ -2,3 +2,4 @@ results/*.txt
 results/*.xlsx
 results/*.png
 .venv/
+local-configs/*.json

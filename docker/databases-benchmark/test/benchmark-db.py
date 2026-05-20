@@ -14,15 +14,19 @@ import matplotlib.pyplot as plt
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 
-local_tests = False
+local_tests = True
 
 if local_tests:
     results_root_path = "../results/"
 
     test_configs = {
-        "local-8048": {
+        "local-old": {
             "orthanc-url": "http://localhost:8048",
-            "results": results_root_path + "local-8048.txt"
+            "results": results_root_path + "local-old.txt"
+        },
+        "local-new": {
+            "orthanc-url": "http://localhost:8049",
+            "results": results_root_path + "local-new.txt"
         }
     }
 else:
@@ -33,23 +37,27 @@ else:
         #     "orthanc-url": "http://orthanc-sqlite-with-index-values:8042",
         #     "results": results_root_path + "sqlite-sqlite-with-index-values.txt"
         # },
-        "sqlite-129": {
-            "orthanc-url": "http://orthanc-sqlite-129:8042",
-            "results": results_root_path + "sqlite-sqlite-129.txt"
-        },
-        "sqlite-without-index-values": {
-            "orthanc-url": "http://orthanc-sqlite-without-index-values:8042",
-            "results": results_root_path + "sqlite-sqlite-without-index-values.txt"
-        },
+            "sqlite-1210": {
+                "orthanc-url": "http://orthanc-sqlite-1210:8042",
+                "results": results_root_path + "sqlite-1210.txt"
+            },
+            "sqlite-next": {
+                "orthanc-url": "http://orthanc-sqlite-next:8042",
+                "results": results_root_path + "sqlite-next.txt"
+            },
 
         # "pg-1.12.4": {
         #     "orthanc-url": "http://orthanc-pg-old:8042",
         #     "results": results_root_path + "pg-1.12.4.txt"
         # },
-        # "pg-1.12.9": {
-        #     "orthanc-url": "http://orthanc-pg-129:8042",
-        #     "results": results_root_path + "pg-1.12.9.txt"
-        # },
+            # "pg-1.12.10": {
+            #     "orthanc-url": "http://orthanc-pg-1210:8042",
+            #     "results": results_root_path + "pg-1.12.10.txt"
+            # },
+            # "pg-next": {
+            #     "orthanc-url": "http://orthanc-pg-next:8042",
+            #     "results": results_root_path + "pg-next.txt"
+            # },
 #   "sqlite-1.12.1": {
 #     "orthanc-url": "http://orthanc-sqlite-121:8042",
 #     "results": results_root_path + "sqlite-1.12.1.txt"
@@ -78,9 +86,11 @@ results_y_axis_titles = ["NA"]
 
 measure_upload_time = True
 measure_upload_time_with_metadata_caching = False  #note, check the docker-compose file and make sure the "DicomWeb.EnableMetadataCache" is configured with the same value !
-measure_tools_find_at_study_level = True
-measure_wado_rs_single_frame = True
-measure_list_series_instances = True
+measure_tools_find_at_study_on_study_date = False
+measure_tools_find_at_study_level_on_patient_name_wildcard_case_insensitive = False
+measure_tools_find_at_study_level_on_patient_name_wildcard_case_sensitive = False
+measure_wado_rs_single_frame = False
+measure_list_series_instances = False
 
 if measure_upload_time:
     results_headers.append(f"Upload {instances_per_step} instances [s]")
@@ -90,8 +100,16 @@ if measure_upload_time_with_metadata_caching:
     results_headers.append(f"Upload {instances_per_step} instances + compute /metadata [s]")
     results_y_axis_titles.append("[s]")
 
-if measure_tools_find_at_study_level:
-    results_headers.append("5x tools/find at study level on StudyDate [ms]")    
+if measure_tools_find_at_study_on_study_date:
+    results_headers.append("5x tools/find at study level on StudyDate (case-sensitive) [ms]")    
+    results_y_axis_titles.append("[ms]")
+
+if measure_tools_find_at_study_level_on_patient_name_wildcard_case_insensitive:
+    results_headers.append("5x tools/find at study level on PatientName (wildcard - case sensitive=false) [ms]")    
+    results_y_axis_titles.append("[ms]")
+
+if measure_tools_find_at_study_level_on_patient_name_wildcard_case_sensitive:
+    results_headers.append("5x tools/find at study level on PatientName (wildcard - case sensitive=true) [ms]")    
     results_y_axis_titles.append("[ms]")
 
 if measure_wado_rs_single_frame:
@@ -137,6 +155,7 @@ def step(test_config):
     logging.info(f"{test_config}: Starting step, #patients: {patients_count_before}, #studies: {studies_count_before}, #instances: {instances_count_before} ")
 
     study_dates = []
+    patient_names = []
     dicom_web_instances_uri = []
     series_dicom_ids = []
     upload_instances_count = 0
@@ -162,6 +181,7 @@ def step(test_config):
                 upload_instances_count += 1
             
         study_dates.append(tags["StudyDate"])
+        patient_names.append(tags["PatientName"])
         dicom_web_instances_uri.append(f"/dicom-web/studies/{tags['StudyInstanceUID']}/series/{tags['SeriesInstanceUID']}/instances/{tags['SOPInstanceUID']}")
         last_series_dicom_id = tags['SeriesInstanceUID']
           
@@ -208,15 +228,32 @@ def step(test_config):
 
     time.sleep(3)
 
-    if measure_tools_find_at_study_level:
+    if measure_tools_find_at_study_on_study_date:
         start_tools_find = time.perf_counter()
         for study_date in study_dates:
-            o.studies.find(query={"StudyDate": study_date})
+            o.studies.find(case_sensitive=True, query={"StudyDate": study_date})
         end_tools_find = time.perf_counter()
-        logging.info(f"{test_config}: 5x tools/find at study level on StudyDate - done in {(end_tools_find - start_tools_find)*1e3:.3f} ms")
+        logging.info(f"{test_config}: 5x tools/find at study level on StudyDate (case sensitive) - done in {(end_tools_find - start_tools_find)*1e3:.3f} ms")
 
         result_row.append(f"{(end_tools_find - start_tools_find)*1e3:.3f}")
 
+    if measure_tools_find_at_study_level_on_patient_name_wildcard_case_insensitive:
+        start_tools_find = time.perf_counter()
+        for patient_name in patient_names:
+            o.studies.find(case_sensitive=False, query={"PatientName": f"*{patient_name[1:-1].lower()}*"})
+        end_tools_find = time.perf_counter()
+        logging.info(f"{test_config}: 5x tools/find at study level on PatientName (wildcard - case sensitive=false)- done in {(end_tools_find - start_tools_find)*1e3:.3f} ms")
+
+        result_row.append(f"{(end_tools_find - start_tools_find)*1e3:.3f}")
+
+    if measure_tools_find_at_study_level_on_patient_name_wildcard_case_sensitive:
+        start_tools_find = time.perf_counter()
+        for patient_name in patient_names:
+            o.studies.find(case_sensitive=True, query={"PatientName": f"*{patient_name[1:-1].lower()}*"})
+        end_tools_find = time.perf_counter()
+        logging.info(f"{test_config}: 5x tools/find at study level on PatientName (wildcard - case sensitive=true)- done in {(end_tools_find - start_tools_find)*1e3:.3f} ms")
+
+        result_row.append(f"{(end_tools_find - start_tools_find)*1e3:.3f}")
 
     if measure_wado_rs_single_frame:
         start_wado_rs = time.perf_counter()

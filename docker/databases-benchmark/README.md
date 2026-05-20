@@ -11,7 +11,14 @@ This demo contains:
 
 # Starting the setup
 
-To start the setup, type: `docker-compose up --build`
+To start the setup, type: `docker-compose up --build`.
+Use `docker-compose down -v` and delete the results files (`sudo rm results/*.txt`) between runs.
+
+One liner:
+
+```
+docker-compose down -v && sudo rm results/*.txt && docker-compose up --build
+```
 
 # results
 

@@ -18,17 +18,17 @@ services:
   #         "StableAge": 1  // To trigger /metadata computation ASAP
   #       }
 
-  orthanc-sqlite-129:
+  orthanc-sqlite-1210:
     # image: ${ORTHANC_IMAGE}
-    image: orthancteam/orthanc:25.10.3
+    image: orthancteam/orthanc:25.12.3
     restart: unless-stopped
     # ports: ["8143:8042"]
-    volumes: ["orthanc-storage-sqlite-129:/var/lib/orthanc/db"]
+    volumes: ["orthanc-storage-sqlite-1210:/var/lib/orthanc/db"]
     environment:
       DICOM_WEB_PLUGIN_ENABLED: "true"
       ORTHANC_JSON: |
         {
-          "Name": "SQLite 1.12.9",
+          "Name": "SQLite 1.12.10",
           "AuthenticationEnabled": false,
           "DicomWeb": {
             "EnableMetadataCache": false
@@ -36,80 +36,105 @@ services:
           "StableAge": 1  // To trigger /metadata computation ASAP
         }
 
-  # orthanc-sqlite-next:
+  orthanc-sqlite-next:
+    # image: ${ORTHANC_IMAGE}
+    image: orthancteam/orthanc-pre-release:case-sensitive-find-normal-unstable-before-tests-amd64
+    restart: unless-stopped
+    ports: ["8144:8042"]
+    volumes: ["orthanc-storage-sqlite-next:/var/lib/orthanc/db"]
+    environment:
+      DICOM_WEB_PLUGIN_ENABLED: "true"
+      ORTHANC_JSON: |
+        {
+          "Name": "SQLite",
+          "AuthenticationEnabled": false,
+          "DicomWeb": {
+            "EnableMetadataCache": false
+          },
+          "StableAge": 1  // To trigger /metadata computation ASAP
+        }
+
+
+
+  orthanc-pg-1210:
+    image: orthancteam/orthanc:25.12.3
+    # image: ${ORTHANC_IMAGE}
+    restart: unless-stopped
+    ports: ["8145:8042"]
+    volumes: ["orthanc-storage-pg-1210-files:/var/lib/orthanc/db"]
+    environment:
+      DICOM_WEB_PLUGIN_ENABLED: "true"
+      ORTHANC_JSON: |
+        {
+          "Name": "PG 1.12.10",
+          "AuthenticationEnabled": false,
+          "StableAge": 1  // To trigger /metadata computation ASAP
+          
+          , "PostgreSQL": {
+            "Host": "pg-1210-db"
+          }
+        }
+
+  pg-1210-db:
+    image: postgres:17
+    restart: unless-stopped
+    volumes: ["pg-1210-db:/var/lib/postgresql/data"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: "trust"
+
+
+  orthanc-pg-next:
+    image: orthancteam/orthanc-pre-release:case-sensitive-find-normal-unstable-before-tests-amd64
+    # image: ${ORTHANC_IMAGE}
+    restart: unless-stopped
+    ports: ["8146:8042"]
+    volumes: ["orthanc-storage-pg-next-files:/var/lib/orthanc/db"]
+    environment:
+      DICOM_WEB_PLUGIN_ENABLED: "true"
+      ORTHANC_JSON: |
+        {
+          "Name": "PG next",
+          "AuthenticationEnabled": false,
+          "StableAge": 1  // To trigger /metadata computation ASAP
+          
+          , "PostgreSQL": {
+            "Host": "pg-next-db"
+          }
+        }
+
+  pg-next-db:
+    image: postgres:17
+    restart: unless-stopped
+    volumes: ["pg-next-db:/var/lib/postgresql/data"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: "trust"
+
+  # orthanc-pg-old:
+  #   image: orthancteam/orthanc:24.11.0
   #   # image: ${ORTHANC_IMAGE}
-  #   image: orthancteam/orthanc-pre-release:queues-timeout-normal-unstable-before-tests-amd64
   #   restart: unless-stopped
-  #   ports: ["8144:8042"]
-  #   volumes: ["orthanc-storage-sqlite-next:/var/lib/orthanc/db"]
+  #   # ports: ["8145:8042"]
+  #   volumes: ["orthanc-storage-pg-old-files:/var/lib/orthanc/db"]
   #   environment:
   #     DICOM_WEB_PLUGIN_ENABLED: "true"
   #     ORTHANC_JSON: |
   #       {
-  #         "Name": "SQLite",
+  #         "Name": "PG old",
   #         "AuthenticationEnabled": false,
-  #         "DicomWeb": {
-  #           "EnableMetadataCache": false
-  #         },
   #         "StableAge": 1  // To trigger /metadata computation ASAP
+
+          
+  #         , "PostgreSQL": {
+  #           "Host": "pg-old-db"
+  #         }
   #       }
 
-
-
-  orthanc-pg-129:
-    image: orthancteam/orthanc:25.10.3
-    # image: ${ORTHANC_IMAGE}
-    restart: unless-stopped
-    # ports: ["8145:8042"]
-    volumes: ["orthanc-storage-pg-129-files:/var/lib/orthanc/db"]
-    environment:
-      DICOM_WEB_PLUGIN_ENABLED: "true"
-      ORTHANC_JSON: |
-        {
-          "Name": "PG 1.12.9",
-          "AuthenticationEnabled": false,
-          "StableAge": 1  // To trigger /metadata computation ASAP
-
-          
-          , "PostgreSQL": {
-            "Host": "pg-129-db"
-          }
-        }
-
-  pg-129-db:
-    image: postgres:17
-    restart: unless-stopped
-    volumes: ["pg-129-db:/var/lib/postgresql/data"]
-    environment:
-      POSTGRES_HOST_AUTH_METHOD: "trust"
-
-
-  orthanc-pg-old:
-    image: orthancteam/orthanc:24.11.0
-    # image: ${ORTHANC_IMAGE}
-    restart: unless-stopped
-    # ports: ["8145:8042"]
-    volumes: ["orthanc-storage-pg-old-files:/var/lib/orthanc/db"]
-    environment:
-      DICOM_WEB_PLUGIN_ENABLED: "true"
-      ORTHANC_JSON: |
-        {
-          "Name": "PG old",
-          "AuthenticationEnabled": false,
-          "StableAge": 1  // To trigger /metadata computation ASAP
-
-          
-          , "PostgreSQL": {
-            "Host": "pg-old-db"
-          }
-        }
-
-  pg-old-db:
-    image: postgres:17
-    restart: unless-stopped
-    volumes: ["pg-old-db:/var/lib/postgresql/data"]
-    environment:
-      POSTGRES_HOST_AUTH_METHOD: "trust"
+  # pg-old-db:
+  #   image: postgres:17
+  #   restart: unless-stopped
+  #   volumes: ["pg-old-db:/var/lib/postgresql/data"]
+  #   environment:
+  #     POSTGRES_HOST_AUTH_METHOD: "trust"
 
   # orthanc-mysql:
   #   image: ${ORTHANC_IMAGE}
@@ -160,12 +185,14 @@ services:
 
 volumes:
   # orthanc-storage-sqlite-121:
-  orthanc-storage-sqlite-129:
-  # orthanc-storage-sqlite-next:
-  orthanc-storage-pg-old-files:
-  orthanc-storage-pg-129-files:
+  orthanc-storage-sqlite-1210:
+  orthanc-storage-sqlite-next:
+  # orthanc-storage-pg-old-files:
+  orthanc-storage-pg-1210-files:
+  orthanc-storage-pg-next-files:
   # orthanc-storage-mysql-files:
-  pg-old-db:
-  pg-129-db:
+  # pg-old-db:
+  pg-1210-db:
+  pg-next-db:
   # mysql-db:
 
