@@ -21,8 +21,9 @@ services:
             - orthanc-sqlite-storage:/var/lib/orthanc/db
 
     minio:
-        image: minio/minio:RELEASE.2024-04-06T05-26-02Z
-        ports: [9000:9000]
+        image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+        # don't expose these ports in a real world setup
+        ports: [9000:9000, 9001:9001]
         environment:
             - MINIO_REGION=eu-west-1
             - MINIO_ROOT_USER=minio
@@ -30,7 +31,7 @@ services:
         volumes:
             - minio-storage:/data
         entrypoint: sh
-        command: -c 'mkdir -p /data/my-sample-bucket && /usr/bin/docker-entrypoint.sh server /data'
+        command: -c 'mkdir -p /data/default-bucket && mkdir -p /data/zip-bucket && /usr/bin/docker-entrypoint.sh server /data --console-address ":9001"'
 
 
 volumes:
