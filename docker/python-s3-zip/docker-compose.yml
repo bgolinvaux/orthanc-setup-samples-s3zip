@@ -54,7 +54,8 @@ services:
                         "VirtualAddressing": false,
                         "EnableCompression": false,
                         "LocalStorageMaxSizeMB": 3000,
-                        "PrefixKey": "orthanc-zips"
+                        "PrefixKey": "orthanc-zips",
+                        "S3HousekeeperIntervalSeconds": 5
                     },
                     "Python": {
                         "AllowThreads": true

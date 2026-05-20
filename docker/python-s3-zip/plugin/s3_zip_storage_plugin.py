@@ -10,6 +10,7 @@ from local_to_s3_zip_manager import (
     DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
     DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
     DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
+    DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS,
 )
 from s3zip_logging import get_logger
 
@@ -366,6 +367,13 @@ def register_s3_zip_storage_plugin():
             DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
         )
     )
+    housekeeper_interval_sec = float(
+        s3_zip_config.get(
+            "S3HousekeeperIntervalSeconds",
+            DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS
+        )
+    )
+
 
     logger.debug("compression setting resolved", enable_compression=enable_compression)
     logger.debug("S3 retrieval retry settings resolved",
@@ -384,7 +392,8 @@ def register_s3_zip_storage_plugin():
                                      key_prefix=key_prefix,
                                      s3_retrieval_max_attempts=s3_retrieval_max_attempts,
                                      s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
-                                     s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec)
+                                     s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec,
+                                     housekeeper_interval_sec=housekeeper_interval_sec)
 
     logger.info("registering storage area callbacks with Orthanc (RegisterStorageArea3)")
     logger.debug("calling orthanc.RegisterStorageArea3()")

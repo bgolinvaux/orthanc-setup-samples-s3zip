@@ -16,11 +16,20 @@ class CustomData:
     storage: Storage
     local_series_folder: str
     s3_zip_key: Optional[str]
+    size_in_bytes: int
+    series_id: Optional[str]   # this value is not available in the storage_create (when storing in tmp-local-storage).  It only becomes available when the series is moved to s3
 
-    def __init__(self, storage: Storage, local_series_folder: str, s3_zip_key: Optional[str] = None):
+    def __init__(self, 
+                 storage: Storage, 
+                 local_series_folder: str, 
+                 size_in_bytes: int,
+                 series_id: Optional[str] = None,
+                 s3_zip_key: Optional[str] = None):
         self.storage = storage
         self.local_series_folder = local_series_folder
         self.s3_zip_key = s3_zip_key
+        self.series_id = series_id
+        self.size_in_bytes = size_in_bytes
 
     def to_binary(self) -> bytes:
         b = self.to_json().encode('utf-8')
@@ -28,19 +37,23 @@ class CustomData:
                      storage=self.storage.value,
                      local_series_folder=self.local_series_folder,
                      s3_zip_key=self.s3_zip_key or "<none>",
-                     size_bytes=len(b))
+                     series_id=self.series_id or "<none>",
+                     size_in_bytes=self.size_in_bytes,
+                     binary_size_bytes=len(b))
         return b
 
     def to_json(self) -> str:
         return json.dumps({
             "storage": self.storage.value,
             "local": self.local_series_folder,
-            "s3zip": self.s3_zip_key
+            "s3zip": self.s3_zip_key,
+            "series-id": self.series_id,
+            "size": self.size_in_bytes
         })
 
     @classmethod
     def from_binary(cls, b: bytes) -> 'CustomData':
-        logger.debug("CustomData deserializing from binary", size_bytes=len(b))
+        logger.debug("CustomData deserializing from binary", binary_size_bytes=len(b))
         return cls.from_json(b.decode('utf-8'))
 
     @classmethod
@@ -49,12 +62,16 @@ class CustomData:
         cd = cls(
             storage=cls.Storage(data["storage"]),
             local_series_folder=data["local"],
-            s3_zip_key=data["s3zip"]
+            s3_zip_key=data["s3zip"],
+            series_id=data["series-id"],
+            size_in_bytes=data["size"]
         )
         logger.debug("CustomData deserialized",
                      storage=cd.storage.value,
                      local_series_folder=cd.local_series_folder,
-                     s3_zip_key=cd.s3_zip_key or "<none>")
+                     s3_zip_key=cd.s3_zip_key or "<none>",
+                     series_id=cd.series_id or "<none>",
+                     size_in_bytes=cd.size_in_bytes)
         return cd
 
     @classmethod
@@ -67,7 +84,9 @@ class CustomData:
                         attachment_uuid=attachment_uuid,
                         storage=cd.storage.value,
                         local_series_folder=cd.local_series_folder,
-                        s3_zip_key=cd.s3_zip_key or "<none>")
+                        s3_zip_key=cd.s3_zip_key or "<none>",
+                        series_id=cd.series_id or "<none>",
+                        size_in_bytes=cd.size_in_bytes)
             return cd
         else:
             return None

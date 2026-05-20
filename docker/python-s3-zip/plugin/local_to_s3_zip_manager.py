@@ -24,6 +24,7 @@ logger = get_logger(__name__)
 DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS = 3
 DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS = 0.5
 DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS = 5.0
+DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS = 60.0
 
 _TRANSIENT_CLIENT_ERROR_CODES = {
     "InternalError",
@@ -276,6 +277,7 @@ class LocalToS3ZipManager:
 
         # list all instances attachments
         attachments_uuids = self._get_instances_attachments(series_id=series_id)
+        attachments_sizes = {}
         local_series_folder = None
 
         logger.debug("collected instance attachments for series",
@@ -302,12 +304,13 @@ class LocalToS3ZipManager:
                                          local_series_folder=local_series_folder)
                         content = self._local_storage.read_file(uuid=a_uuid,
                                                                 local_series_folder=local_series_folder)
-                        total_uncompressed_bytes += len(content)
+                        attachments_sizes[a_uuid] = len(content)
+                        total_uncompressed_bytes += attachments_sizes[a_uuid]
                         logger.debug("adding attachment to zip",
                                      series_id=series_id,
                                      uuid=a_uuid,
                                      index=idx,
-                                     size_bytes=len(content))
+                                     size_bytes=attachments_sizes[a_uuid])
                         zipf.writestr(a_uuid, content)
                         logger.debug("attachment added to zip",
                                      series_id=series_id,
@@ -351,10 +354,6 @@ class LocalToS3ZipManager:
                             upload_ms=int((t_upload_done - t_zip_done) * 1000))
 
                 # Update the custom data to notify that the file is now stored in a zip in S3
-                s3_custom_data = CustomData(storage=CustomData.Storage.S3_ZIP,
-                                            local_series_folder=local_series_folder,
-                                            s3_zip_key=s3_key).to_binary()
-
                 logger.info("starting SetAttachmentCustomData loop",
                             series_id=series_id,
                             attachment_count=len(attachments_uuids),
@@ -367,6 +366,13 @@ class LocalToS3ZipManager:
                                  uuid=a_uuid,
                                  index=idx,
                                  total=len(attachments_uuids))
+
+                    s3_custom_data = CustomData(storage=CustomData.Storage.S3_ZIP,
+                                                local_series_folder=local_series_folder,
+                                                s3_zip_key=s3_key,
+                                                series_id=series_id,
+                                                size_in_bytes=attachments_sizes[a_uuid]).to_binary()
+
                     orthanc.SetAttachmentCustomData(a_uuid, s3_custom_data)
                     logger.debug("orthanc.SetAttachmentCustomData() returned",
                                  series_id=series_id,
@@ -597,6 +603,44 @@ class LocalToS3ZipManager:
         finally:
             self._release_zip_retrieval(zip_retrieval)
 
+    def delete_zip_from_s3(self, s3_zip_key: str):
+        started_at = time.monotonic()
+        for attempt in range(1, self._s3_retrieval_max_attempts + 1):
+            try:
+                self._s3_client.delete_object(Bucket=self._bucket_name,
+                                              Key=s3_zip_key)
+                logger.info(f"deleted zip from s3: {s3_zip_key}")
+                return
+            except Exception as e:
+                retryable = self._is_retryable_s3_retrieval_exception(e)
+                is_last_attempt = attempt >= self._s3_retrieval_max_attempts
+                if not retryable or is_last_attempt:
+                    logger.error(
+                        "zip deletion from S3 failed",
+                        s3_zip_key=s3_zip_key,
+                        bucket=self._bucket_name,
+                        attempt=attempt,
+                        max_attempts=self._s3_retrieval_max_attempts,
+                        retryable=retryable,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    )
+                    raise
+
+                delay_sec = self._get_s3_retrieval_retry_delay_sec(attempt)
+                logger.warning(
+                    "zip deletion from S3 failed, retrying",
+                    s3_zip_key=s3_zip_key,
+                    bucket=self._bucket_name,
+                    attempt=attempt,
+                    max_attempts=self._s3_retrieval_max_attempts,
+                    retry_delay_ms=int(delay_sec * 1000),
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+                if delay_sec > 0:
+                    time.sleep(delay_sec)
 
     def _retrieve_zip_from_s3(self, s3_zip_key: str, local_series_folder: str):
         started_at = time.monotonic()

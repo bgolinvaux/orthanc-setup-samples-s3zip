@@ -309,6 +309,7 @@ class FolderLeaseTests(unittest.TestCase):
                     uuid="instance",
                     local_series_folder="series",
                     content_type=orthanc_stub.ContentType.DICOM,
+                    file_size=0
                 )
 
 
@@ -394,6 +395,7 @@ class ConcurrentStressTests(unittest.TestCase):
                                 uuid=uuid,
                                 local_series_folder=folder,
                                 content_type=orthanc_stub.ContentType.DICOM,
+                                file_size=0
                             )
                         except Exception as e:
                             record(e)
@@ -493,6 +495,7 @@ class S3ZipStorageReadTests(unittest.TestCase):
             storage=CustomData.Storage.S3_ZIP,
             local_series_folder="series",
             s3_zip_key="series.zip",
+            size_in_bytes=0
         ).to_binary()
 
         error_code, data = storage.storage_read_range(
@@ -779,6 +782,7 @@ class CopySeriesToS3Tests(unittest.TestCase):
             custom_data = CustomData(
                 storage=CustomData.Storage.LOCAL,
                 local_series_folder="series",
+                size_in_bytes=0
             )
             set_custom_data_calls = []
 
@@ -815,6 +819,7 @@ class CopySeriesToS3Tests(unittest.TestCase):
             custom_data = CustomData(
                 storage=CustomData.Storage.LOCAL,
                 local_series_folder="series",
+                size_in_bytes=0
             )
 
             # First call: initial snapshot. Second call (the recheck): a third

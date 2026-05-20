@@ -1,6 +1,6 @@
 import orthanc
 import os
-import json
+import threading
 from helpers import Helpers
 from typing import Optional, Tuple
 from boto3 import client as S3Client
@@ -9,6 +9,7 @@ from local_to_s3_zip_manager import (
     DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
     DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
     DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
+    DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS,
     LocalToS3ZipManager,
     SeriesS3Info,
 )
@@ -24,6 +25,9 @@ class S3ZipStorage:
     _local_storage: LocalStorage
     _zip_manager: LocalToS3ZipManager
     _uncommitted_series_handler: UncommittedSeriesHandler
+    _housekeeper_enabled: bool = False
+    _housekeeper_interval_sec: float
+    _housekeeper_timer: threading.Timer = None
 
     def __init__(self,
                  temporary_folder_root: str,
@@ -34,7 +38,8 @@ class S3ZipStorage:
                  key_prefix: str = "",
                  s3_retrieval_max_attempts: int = DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
                  s3_retrieval_retry_base_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
-                 s3_retrieval_retry_max_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS):
+                 s3_retrieval_retry_max_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
+                 housekeeper_interval_sec: float = DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS):
         logger.debug("initializing S3ZipStorage",
                      temp_folder=temporary_folder_root,
                      max_size_mb=temp_folder_max_size_mb,
@@ -43,7 +48,8 @@ class S3ZipStorage:
                      key_prefix=key_prefix or "<none>",
                      s3_retrieval_max_attempts=s3_retrieval_max_attempts,
                      s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
-                     s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec)
+                     s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec,
+                     housekeeper_interval_sec=housekeeper_interval_sec)
 
         self._uncommitted_series_handler = UncommittedSeriesHandler()
 
@@ -67,6 +73,8 @@ class S3ZipStorage:
             return os.path.exists(marker_path)
 
         self._local_storage.set_eviction_guard(_is_folder_safe_to_evict)
+        self._housekeeper_interval_sec = housekeeper_interval_sec
+        self._housekeeper_enabled = housekeeper_interval_sec >= 1
 
         logger.debug("S3ZipStorage initialized")
 
@@ -96,9 +104,21 @@ class S3ZipStorage:
         logger.debug("starting S3ZipStorage manager")
         self._zip_manager.start()
 
+        if self._housekeeper_enabled:
+            logger.debug(f"Starting housekeeper with an interval of {self._housekeeper_interval_sec} sec")
+            self.perform_housekeeping()  # and it will repeat
+        else:
+            logger.debug(f"NOT starting housekeeper")
+
+
     def stop(self):
         logger.debug("stopping S3ZipStorage manager")
         self._zip_manager.stop()
+
+        if self._housekeeper_timer:
+            logger.debug("stopping housekeeper")
+            self._housekeeper_timer.cancel()
+
 
     def on_new_series(self, series_id: str):
         self._uncommitted_series_handler.on_new_series(series_id=series_id)
@@ -152,7 +172,9 @@ class S3ZipStorage:
         with self._local_storage.folder_marker_critical_section(series_hash):
             _ = self._zip_manager.invalidate_s3_uploaded_marker(local_series_folder=series_hash)
 
-        custom_data = CustomData(CustomData.Storage.LOCAL, local_series_folder=series_hash)
+        custom_data = CustomData(CustomData.Storage.LOCAL, 
+                                 local_series_folder=series_hash,
+                                 size_in_bytes=len(content))
 
         logger.debug("storage_create completed",
                      uuid=uuid,
@@ -276,10 +298,12 @@ class S3ZipStorage:
         logger.debug("calling local_storage.remove()", uuid=uuid)
         self._local_storage.remove(uuid=uuid,
                                    local_series_folder=cd.local_series_folder,
-                                   content_type=content_type)
+                                   content_type=content_type,
+                                   file_size=cd.size_in_bytes)
         logger.debug("local_storage.remove() returned", uuid=uuid)
 
-        # TODO: we should probably mark the file as deleted somehow but, how and when do we remove the zip in S3 ?
+        if self._housekeeper_enabled and cd.series_id: # this only happens if the series has been uploaded into s3
+            orthanc.StoreKeyValue("series-ids-to-possibly-delete-from-s3", cd.series_id, custom_data) # cd.s3_zip_key.encode('utf-8') if cd.s3_zip_key else b'')
 
         logger.debug("storage_remove completed", uuid=uuid)
 
@@ -299,3 +323,42 @@ class S3ZipStorage:
     def get_s3_zip_stream(self, series_id: str):  # returns a stream
         logger.debug("retrieving a series S3 zip stream", series_id=series_id)
         return self._zip_manager.get_s3_zip_stream(series_id=series_id)
+
+    def perform_housekeeping(self):
+        self._housekeeper_timer = None
+        try:
+            self._perform_housekeeping()
+
+        finally:
+            # reschedule
+            self._housekeeper_timer = threading.Timer(self._housekeeper_interval_sec, self.perform_housekeeping)
+            self._housekeeper_timer.start()
+
+    def _perform_housekeeping(self):
+        logger.debug("Performing housekeeping")
+
+        series_iterator = orthanc.CreateKeysValuesIterator("series-ids-to-possibly-delete-from-s3")
+        series_to_remove_from_kvs = []
+        while series_iterator.Next():
+            series_id = series_iterator.GetKey()
+            cd = CustomData.from_binary(series_iterator.GetValue())
+            try:
+                orthanc.RestApiGet(f"/series/{series_id}/instances")
+                logger.debug(f"Housekeeper: the series {series_id} is STILL in Orthanc, not deleting it")
+                series_to_remove_from_kvs.append(series_id)  # we will retry later if other instances are deleted, the series will be pushed in the KVS again
+            except orthanc.OrthancException as e:
+                if e.args[0] == orthanc.ErrorCode.UNKNOWN_RESOURCE:
+                    if cd.s3_zip_key:
+                        logger.info(f"Housekeeper: the series {series_id} is NOT in Orthanc, deleting its zip from S3")
+                        self._zip_manager.delete_zip_from_s3(s3_zip_key=cd.s3_zip_key)
+                        series_to_remove_from_kvs.append(series_id)  # now that it has been deleted, remove it from the KVS
+                    # TODO (possibly): delete the local folder but, we could be receiving a new instance at that exact same time so it is probably better to just leave it.
+                    # Note that the local folder only contains the .s3-uploaded file that does not consume much space.
+                else:
+                    logger.exception("Housekeeper error", str(e))
+
+        for series_id in series_to_remove_from_kvs:
+            logger.debug(f"Housekeeper: removing the series {series_id} from the 'series-ids-to-possibly-delete-from-s3' KVS")
+            orthanc.DeleteKeyValue("series-ids-to-possibly-delete-from-s3", series_id)
+
+        logger.debug("Performed housekeeping")

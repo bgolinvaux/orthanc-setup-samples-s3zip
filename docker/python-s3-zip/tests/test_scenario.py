@@ -11,6 +11,7 @@ import os
 import threading
 import hashlib
 import pprint
+from botocore.exceptions import ClientError
 from contextlib import contextmanager
 from python_on_whales import DockerClient
 
@@ -96,7 +97,7 @@ def wait_until_zip_found_on_s3(series_id: str):
             return
         except Exception as e:
             pass
-        time.sleep(10)
+        time.sleep(1)
 
 
 def get_zip_size_on_s3(series_id: str):
@@ -109,6 +110,24 @@ def get_zip_size_on_s3(series_id: str):
 
     response = s3_client.head_object(Bucket="zip-bucket", Key=f"orthanc-zips/{series_id}.zip")
     return response['ContentLength']
+
+
+def is_zip_size_on_s3(series_id: str):
+    boto_session = boto3.Session(region_name="eu-west-1",
+                                 aws_access_key_id="minio",
+                                 aws_secret_access_key="miniopwd")
+    s3_client = boto_session.client('s3',
+                                    endpoint_url="http://localhost:9000",
+                                    config=boto3.session.Config(s3={'addressing_style': 'path'}))
+
+    try:
+        s3_client.head_object(Bucket="zip-bucket", Key=f"orthanc-zips/{series_id}.zip")
+        return True
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            return False
+        raise e
+
 
 def get_series_hash(patient_id: str, study_uid: str, series_uid: str) -> str:
     combined_id = f"{patient_id}|{study_uid}|{series_uid}"
@@ -135,7 +154,11 @@ zip_orthanc.delete_all_content()
 
 
 print("---------------- Test Deletion on zip Orthanc ----------------")
-zip_orthanc.post("/s3-zip/local-cache/evict-all")
+
+print("Cleaning S3 zip local storage")
+docker.execute("python-s3-zip-orthanc-s3-zip-1", ["bash", "-c", "rm -rf /tmp-local-storage/*"])
+
+# zip_orthanc.post("/s3-zip/local-cache/evict-all")
 zip_populator = OrthancTestDbPopulator(api_client=zip_orthanc,
                                        studies_count=1,
                                        series_count=1,
@@ -175,7 +198,7 @@ file_count = len([f for f in os.listdir(os.path.join(local_tmp_storage_dir, loca
 if file_count != 80:
     print(f"Found {file_count} files in local folder instead of 80")
     exit(-23)
-# note: at this point, the zip on s3 still contains 90 files but there's "nothgin" we can do about it !!
+# note: at this point, the zip on s3 still contains 90 files but there's "nothing" we can do about it !!
 
 # pprint.pprint(zip_orthanc.get_json("/s3-zip/local-cache/stats"))
 
@@ -197,7 +220,11 @@ if stats.get('used_bytes') > 100:
     print(f"Only one .s3-uploaded file should remain found {stats.get('used_bytes')} byte remaining")
     exit(-26)
 
-exit(0)
+print("Waiting for the housekeeper to remove the zip on s3")
+time.sleep(6)
+if is_zip_size_on_s3(series_id=series_id):
+    print(f"The zip has not been removed from s3: {series_id}")
+    exit(-27)
 
 print("---------------- Test Deletion on zip Orthanc - done ----------------")
 

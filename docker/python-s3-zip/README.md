@@ -26,16 +26,3 @@ The test scenario:
 - restarts the system to clear the storage caches
 - download the studies again
 
-TODO/To discuss:
-- series deletions (delete local files + delete zip files in S3 (on DELETED_SERIES event ?)).  This should not be required since we want to keep both the source and the anonymized studies
-
-Done:
-- use a queue to perform `move_series_to_s3` asynchronously
-- remove series from `LocalToS3ZipManager`
-- add a flag to disable compression in the zip algo ?
-- handle max size for the local temporary storage
-- added an API route to know where the series is `/series/.../s3-zip/status`
-- added an API route to schedule the copy to s3 before the StableSeries event `/series/.../s3-zip/copy-to-s3`
-- added an API route override to download the zip directly from s3 through Orthanc `/series/.../archive`
-- handle Orthanc stopped before the zip is moved to S3 and the temporary storage is lost -> remove the resource from Orthanc SQL DB (done in `UncommittedSeriesHandler`)
-
