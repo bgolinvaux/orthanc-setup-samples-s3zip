@@ -1,7 +1,6 @@
 # Purpose
 
-This is a sample setup to demonstrate the usage of the Orthanc as an AI gateway and a cloud gateway to interface
-a PACS with an AI algo in the cloud.
+This is a sample setup to demonstrate the usage of Orthanc as an AI gateway to interface a PACS with an AI algo in the cloud.
 
 In this sample, the AI algo generates a new " - PROCESSED" series for each series that it receives.
 
@@ -20,6 +19,8 @@ This demo contains:
 - An `authorization-service` container that runs in the cloud and is used by Orthanc to authenticate users and
   filter the allowed actions/resources.
 
+# How it works
+
 When the site A gateway receives a series from its local PACS, a python plugin triggers the anonymization of the series
 and sends it to the Orthanc in the cloud through DICOMweb STOW-RS (note: we could also use the Transfer Accelerator Plugin).
 During the anonymization, the gateway also inserts the `site-id` in the `InstitutionName` DICOM tag.  This `site-id` is
@@ -34,7 +35,7 @@ but Site B will see the data from Site A.  That's the reason why we recommend us
 
 Once a gateway has uploaded a series, it adds the series to a list of "series being processed" and starts polling the central server
 for results.  For each series, it is able to request for its " - PROCESSED" series by searching by `StudyInstanceUID` and `SeriesNumber`.
-The gateway also waits that the number of instances of the " - PROCESSED" series is identical to the source series before downloading it.
+The gateway also waits that the number of instances of the " - PROCESSED" series is identical to the source series before retrieving it.
 For this polling, the gateway uses `QIDO-RS` and then uses `WADO-RS` to download it.
 After a number of retries, if the processed series is not available, the gateway will stop polling.
 
