@@ -62,6 +62,7 @@ These sample setups require Docker to run.  They have been tested only on Linux 
 - [Run orthanc as non-root user](docker/run-as-user) to demontrate how to run the orthancteam/orthanc image as a non root user
 - [Job service](docker/job-service) to demonstrate how to run a side web-service to centralize the jobs of multiple Orthanc instances running behind a load balancer
 - [Java plugin](docker/java) to demonstrate how to deploy a Java plugin
+- [AI Gateway](docker/ai-gateway) to demonstrate how to use the Orthanc as a Gateway between a PACS and an algo in the cloud.
 
 ## for orthanc developers
 - [Orthanc integration tests](docker/orthanc-integration-tests) to demonstrate how to run the [Orthanc integration tests](https://bitbucket.org/sjodogne/orthanc-tests)

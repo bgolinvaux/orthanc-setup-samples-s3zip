@@ -1,0 +1,201 @@
+services:
+
+  local-pacs-a:
+    image: orthancteam/orthanc:26.4.2
+    ports: ["4252:4242", "8052:8042"]
+    volumes: ["storage-local-pacs-a:/var/lib/orthanc/db/"]
+    environment:
+      VERBOSE_STARTUP: true
+      VERBOSE_ENABLED: true
+      ORTHANC_JSON: |
+        {
+          "Name": "Local pacs A",
+          "DicomAet": "LOCAL-PACS-A",
+          "AuthenticationEnabled": false,
+          "DicomModalities": {
+            "ai-gateway" : {
+              "AET" : "AI-GATEWAY",
+              "Port" : 4242,
+              "Host" : "ai-gateway-a"
+            }
+          }
+        }
+
+  ai-gateway-a:
+    image: orthancteam/orthanc:26.4.2
+    ports: ["4253:4242", "8053:8042"]
+    volumes: 
+      - storage-ai-gateway-a:/var/lib/orthanc/db/
+      - ./ai-gateway/plugin.py:/scripts/plugin.py
+    environment:
+      VERBOSE_STARTUP: true
+      VERBOSE_ENABLED: true
+      DICOM_WEB_PLUGIN_ENABLED: true
+      SITE_ID: "site-a-id-followed-by-high-entropy-uuid"
+      ORTHANC_JSON: |
+        {
+          "Name": "Orthanc AI Gateway",
+          "DicomAet": "AI-GATEWAY",
+          "AuthenticationEnabled": false,
+          "OverwriteInstances": true,
+          "MaximumStorageSize": 5000,       // make sure we do not consume too much space
+          "MaximumStorageMode": "Recycle",  // remove oldest exams when reclaiming space
+          "DicomModalities": {
+            "local-pacs": ["LOCAL-PACS-A", "local-pacs-a", 4242]
+          },
+          "StableAge": 3, // low value for the demo only
+          "PythonScript": "/scripts/plugin.py",
+          "DicomWeb" : {
+            "EnableMetadataCache": false, // not necessary since we won't visualize the data
+            "Servers": {
+              "cloud": {
+                "Url": "http://orthanc-cloud-for-gw:8042/dicom-web/",
+                "HttpHeaders": {
+                  "api-key" : "site-a-api-key"
+                }
+              }
+            }
+          }
+        }
+  
+  local-pacs-b:
+    image: orthancteam/orthanc:26.4.2
+    ports: ["4262:4242", "8062:8042"]
+    volumes: ["storage-local-pacs-b:/var/lib/orthanc/db/"]
+    environment:
+      VERBOSE_STARTUP: true
+      VERBOSE_ENABLED: true
+      ORTHANC_JSON: |
+        {
+          "Name": "Local pacs B",
+          "DicomAet": "LOCAL-PACS-B",
+          "AuthenticationEnabled": false,
+          "DicomModalities": {
+            "ai-gateway" : {
+              "AET" : "AI-GATEWAY",
+              "Port" : 4242,
+              "Host" : "ai-gateway-b"
+            }
+          }
+        }
+
+  ai-gateway-b:
+    image: orthancteam/orthanc:26.4.2
+    ports: ["4263:4242", "8063:8042"]
+    volumes: 
+      - storage-ai-gateway-b:/var/lib/orthanc/db/
+      - ./ai-gateway/plugin.py:/scripts/plugin.py
+    environment:
+      VERBOSE_STARTUP: true
+      VERBOSE_ENABLED: true
+      DICOM_WEB_PLUGIN_ENABLED: true
+      SITE_ID: "site-b-id-followed-by-high-entropy-uuid"
+      ORTHANC_JSON: |
+        {
+          "Name": "Orthanc AI Gateway",
+          "DicomAet": "AI-GATEWAY",
+          "AuthenticationEnabled": false,
+          "OverwriteInstances": true,
+          "MaximumStorageSize": 5000,       // make sure we do not consume too much space
+          "MaximumStorageMode": "Recycle",  // remove oldest exams when reclaiming space
+          "DicomModalities": {
+            "local-pacs": ["LOCAL-PACS-B", "local-pacs-b", 4242]
+          },
+          "StableAge": 3, // low value for the demo only
+          "PythonScript": "/scripts/plugin.py",
+          "DicomWeb" : {
+            "EnableMetadataCache": false, // not necessary since we won't visualize the data
+            "Servers": {
+              "cloud": {
+                "Url": "http://orthanc-cloud-for-gw:8042/dicom-web/",
+                "HttpHeaders": {
+                  "api-key" : "site-b-api-key"
+                }
+              }
+            }
+          }
+        }
+  orthanc-cloud-for-gw:
+    image: orthancteam/orthanc
+    ports: ["8100:8042"]
+    volumes: 
+      - storage-orthanc-cloud:/var/lib/orthanc/db/
+      - ./orthanc-cloud-for-gw/plugin.py:/scripts/plugin.py
+    depends_on:
+      - orthanc-cloud-db
+      - cloud-auth-service
+    environment:
+      VERBOSE_STARTUP: true
+      VERBOSE_ENABLED: true
+      DICOM_WEB_PLUGIN_ENABLED: true
+      ORTHANC_JSON: |
+        {
+          "Name": "Orthanc Cloud for GW",
+          "DicomServerEnabled": false,
+          "AuthenticationEnabled": false,  // because we use the authorization plugin
+          "PostgreSQL" : {
+            "Host": "orthanc-cloud-db"
+          },
+          "StableAge": 3, // low value for the demo only
+          "Authorization": {
+            //"WebService": "http://cloud-auth-service:8000/auth/validate",
+            "WebServiceUserProfileUrl": "http://cloud-auth-service:8000/user/get-profile",
+            "TokenHttpHeaders": [
+                "api-key"
+            ],
+            // auth checks are performed at study level
+            "CheckedLevel": "studies"
+          },
+          "DicomWeb" : {
+            "EnableMetadataCache": false  // not necessary since we won't visualize the data
+          },
+          "PythonScript": "/scripts/plugin.py"
+        }
+
+  orthanc-cloud-for-admin:
+    image: orthancteam/orthanc
+    # this one should not be exposed
+    ports: ["8101:8042"]
+    volumes: ["storage-orthanc-cloud:/var/lib/orthanc/db/"]
+    depends_on:
+      - orthanc-cloud-db
+    environment:
+      VERBOSE_STARTUP: true
+      VERBOSE_ENABLED: true
+      DICOM_WEB_PLUGIN_ENABLED: true
+      ORTHANC_JSON: |
+        {
+          "Name": "Orthanc Cloud for Admin",
+          "DicomServerEnabled": false,
+          "RegisteredUsers": {
+            "admin": "admin"
+          },
+          "PostgreSQL" : {
+            "Host": "orthanc-cloud-db"
+          }
+        }
+
+
+  orthanc-cloud-db:
+    image: postgres:18
+    restart: unless-stopped
+    volumes: ["orthanc-cloud-db:/var/lib/postgresql/18/docker"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: "trust"
+
+
+  cloud-auth-service:
+    build: auth-service
+    # don't expose in production !
+    ports: ["8000:8000"]
+    restart: unless-stopped
+
+
+
+volumes:
+  storage-local-pacs-a:
+  storage-ai-gateway-a:
+  storage-local-pacs-b:
+  storage-ai-gateway-b:
+  storage-orthanc-cloud:
+  orthanc-cloud-db:
