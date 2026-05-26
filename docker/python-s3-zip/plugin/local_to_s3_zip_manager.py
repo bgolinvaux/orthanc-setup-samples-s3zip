@@ -223,6 +223,54 @@ class LocalToS3ZipManager:
             return f"{self._key_prefix}/{series_id}.zip"
         return f"{series_id}.zip"
 
+    def _any_attachment_has_local_file(self, attachments_uuids: List[str]) -> bool:
+        """Probe whether at least one attachment has a local file on disk.
+
+        Used by ``copy_series_to_s3``'s fast-path guard to recognise
+        "data wiped, never made it to S3" without diving into the upload
+        loop. Errors per attachment are treated as "not present" so a
+        flaky CustomData lookup cannot accidentally suppress the guard.
+        """
+        for a_uuid in attachments_uuids:
+            try:
+                cd = CustomData.from_orthanc_attachment(attachment_uuid=a_uuid)
+            except Exception:
+                continue
+            if cd is None:
+                continue
+            try:
+                if self._local_storage.has_local_file(
+                    uuid=a_uuid,
+                    local_series_folder=cd.local_series_folder,
+                    content_type=orthanc.ContentType.DICOM,
+                ):
+                    return True
+            except Exception:
+                # Treat probe errors as "not present"; the real upload
+                # attempt below would surface a precise failure mode.
+                continue
+        return False
+
+
+    def _resolve_local_series_folder(self, attachments_uuids: list[str]) -> str | None:
+        """Return the first readable ``local_series_folder`` across attachments.
+
+        All instances of a series share the same folder (see the existing
+        zip-build loop), so the first non-empty value is authoritative.
+        Per-attachment errors are swallowed so a flaky CustomData lookup
+        does not prevent resolution when other attachments still carry it.
+        """
+        for a_uuid in attachments_uuids:
+            try:
+                cd: CustomData | None = CustomData.from_orthanc_attachment(attachment_uuid=a_uuid)
+            except Exception:
+                continue
+            if cd is None:
+                continue
+            if cd.local_series_folder:
+                return cd.local_series_folder
+        return None
+
 
     def schedule_copy_series_to_s3(self, series_id: str):
         logger.debug("enqueuing series for S3 copy", series_id=series_id)
@@ -283,6 +331,80 @@ class LocalToS3ZipManager:
         logger.debug("collected instance attachments for series",
                      series_id=series_id,
                      attachment_count=len(attachments_uuids))
+
+        # Dedup early-exit: the same series can be enqueued twice under
+        # heavy ingest -- once by the natural STABLE_SERIES path, once
+        # by the uncommitted-series housekeeper after the 5 min grace
+        # period when the natural copy hasn't drained the queue yet.
+        # The marker is the durable "folder contents match the S3 zip"
+        # invariant (storage_create wipes it on every new instance), so
+        # its presence is sufficient to skip a redundant rebuild + PUT
+        # + per-attachment SetAttachmentCustomData round-trip.
+        #
+        # This check runs BEFORE the fast-path "data lost" guard below.
+        # Otherwise an eviction between the first and second dequeue
+        # (allowed precisely because the marker was written) would
+        # purge the folder, the guard would see no local files, and we
+        # would emit a misleading "data is lost" ERROR for a series
+        # that is in fact safely on S3.
+        if attachments_uuids:
+            cached_folder = self._resolve_local_series_folder(attachments_uuids)
+            if cached_folder:
+                marker_path = os.path.join(
+                    self._local_storage.get_folder_path(cached_folder),
+                    ".s3-uploaded",
+                )
+                with self._local_storage.folder_marker_critical_section(cached_folder):
+                    if os.path.exists(marker_path):
+                        logger.info(
+                            "copy_series_to_s3: .s3-uploaded marker already present; "
+                            "skipping redundant upload (duplicate enqueue)",
+                            series_id=series_id,
+                            local_series_folder=cached_folder,
+                        )
+                        try:
+                            self._uncommitted_series_handler.on_committed_series(series_id=series_id)
+                        except Exception:
+                            logger.exception(
+                                "copy_series_to_s3: failed to clear uncommitted-series KVS entry "
+                                "on duplicate-enqueue skip; housekeeper will retry",
+                                series_id=series_id,
+                            )
+                        return
+
+        # Fast-path guard: if not a single attachment is on local disk,
+        # the data has been wiped without ever reaching S3 (typically
+        # because a pod restart cleared the ephemeral S3Zip volume
+        # before this series was uploaded). Without this guard the
+        # first read_file call would raise FileNotFoundError, the
+        # worker would re-enqueue, and the queue would spin every
+        # 600s for the life of the deployment. Acknowledge gracefully
+        # so the queue makes forward progress.
+        #
+        # The matching housekeeper pass detects this state and emits an
+        # ERROR log of its own; we log here too so a missed copy is
+        # visible even without the housekeeper.
+        #
+        # TODO: when an Orthanc series-level metadata tag exists for
+        # "data lost" (see s3_zip_storage._housekeep_one_uncommitted_series),
+        # set it here. The housekeeper can then enumerate lost series via
+        # a single /tools/find rather than walking logs.
+        if attachments_uuids and not self._any_attachment_has_local_file(attachments_uuids):
+            logger.error(
+                "copy_series_to_s3: no local data left for any attachment; data is lost. "
+                "Acknowledging without re-enqueueing.",
+                series_id=series_id,
+                attachment_count=len(attachments_uuids),
+            )
+            try:
+                self._uncommitted_series_handler.on_committed_series(series_id=series_id)
+            except Exception:
+                logger.exception(
+                    "copy_series_to_s3: failed to clear uncommitted-series KVS entry "
+                    "after abandoning; housekeeper will retry the cleanup",
+                    series_id=series_id,
+                )
+            return
 
         total_uncompressed_bytes = 0
 
@@ -695,6 +817,7 @@ class LocalToS3ZipManager:
 
         file_count = 0
         total_bytes = 0
+        extracted_uuids: set[str] = set()
 
         with tempfile.NamedTemporaryFile(delete=True, suffix=".zip") as tmp_zip:
             logger.debug("downloading zip from S3",
@@ -734,11 +857,62 @@ class LocalToS3ZipManager:
                                                        content=content)
                         file_count += 1
                         total_bytes += len(content)
+                        extracted_uuids.add(file_info.filename)
                         logger.debug("extracted file from zip to local storage",
                                      s3_zip_key=s3_zip_key,
                                      uuid=file_info.filename,
                                      size_bytes=len(content),
                                      index=file_count)
+
+        # Publish the .s3-uploaded marker so the eviction guard and the
+        # local-cache stats both reflect that this folder is recoverable
+        # from S3 at s3_zip_key.
+        #
+        # The retrieve path is the second place (besides the copy thread)
+        # that leaves a folder on disk whose contents fully match the S3 zip;
+        # without this write the folder would be reported as "not yet on S3"
+        # and protected from eviction forever even though the zip is durable.
+        #
+        # Race protection: the per-folder marker critical section serializes
+        # against storage_create's invalidate path. Inside the section we
+        # listdir the folder and only write the marker if its non-marker
+        # contents equal exactly the set of uuids we just extracted.
+        #
+        # So that, if a concurrent storage_create wrote a new instance file
+        # into this folder during retrieval, the extra file is visible and
+        # we skip the marker (the next STABLE_SERIES copy will publish a marker
+        # that reflects the new instance)
+        #
+        # The folder lease held by retrieve_zip_from_s3 keeps eviction out for
+        # the whole window.
+
+        folder_path: str = self._local_storage.get_folder_path(local_series_folder)
+        with self._local_storage.folder_marker_critical_section(local_series_folder):
+            try:
+                on_disk = {
+                    name for name in os.listdir(folder_path)
+                    if name != ".s3-uploaded" and not name.startswith(".s3-uploaded.tmp-")
+                }
+            except FileNotFoundError:
+                on_disk = None
+
+            if on_disk == extracted_uuids:
+                self._write_s3_uploaded_marker(
+                    local_series_folder=local_series_folder,
+                    s3_key=s3_zip_key,
+                    series_id=local_series_folder,
+                )
+            else:
+                # Handle the situation where the series has been modified during retrieval.
+
+                logger.info(
+                    "retrieve: folder contents differ from zip; skipping marker write "
+                    "(a concurrent storage_create likely added an instance during retrieval)",
+                    s3_zip_key=s3_zip_key,
+                    local_series_folder=local_series_folder,
+                    extracted_count=len(extracted_uuids),
+                    on_disk_count=(None if on_disk is None else len(on_disk)),
+                )
 
         duration_ms = int((time.monotonic() - t0) * 1000)
 
