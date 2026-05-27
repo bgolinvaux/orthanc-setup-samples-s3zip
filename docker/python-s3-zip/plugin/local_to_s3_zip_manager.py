@@ -13,6 +13,7 @@ from local_storage_interface import LocalStorageInterface
 from uncommitted_series_handler import UncommittedSeriesHandler
 from custom_data import CustomData
 from s3zip_logging import get_logger
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from botocore import exceptions as botocore_exceptions
@@ -360,7 +361,7 @@ class LocalToS3ZipManager:
                             s3_key=s3_key)
                 t_meta_start = time.monotonic()
 
-                for idx, a_uuid in enumerate(attachments_uuids):
+                def set_attachment_custom_data(a_uuid: str, idx: int):
                     logger.debug("calling orthanc.SetAttachmentCustomData()",
                                  series_id=series_id,
                                  uuid=a_uuid,
@@ -378,6 +379,14 @@ class LocalToS3ZipManager:
                                  series_id=series_id,
                                  uuid=a_uuid,
                                  index=idx)
+
+                with ThreadPoolExecutor(max_workers=12) as executor:
+                    futures = [executor.submit(set_attachment_custom_data, a_uuid, idx)
+                            for idx, a_uuid in enumerate(attachments_uuids)]
+                    
+                    # Wait for all tasks to complete and propagate any exceptions
+                    for future in futures:
+                        future.result()
 
                 t_meta_done = time.monotonic()
                 logger.info("SetAttachmentCustomData loop complete",
