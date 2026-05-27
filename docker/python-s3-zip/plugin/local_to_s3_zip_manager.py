@@ -3,6 +3,7 @@ import json
 import zipfile
 import os
 import random
+import sys
 import tempfile
 import threading
 import time
@@ -25,6 +26,10 @@ DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS = 3
 DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS = 0.5
 DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS = 5.0
 DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS = 60.0
+DEFAULT_COPY_QUEUE_LEASE_TIMEOUT_SECONDS = 1800
+
+_COPY_QUEUE_NAME = "series-to-copy"
+_COPY_QUEUE_IDLE_SLEEP_SECONDS = 1
 
 _TRANSIENT_CLIENT_ERROR_CODES = {
     "InternalError",
@@ -168,6 +173,7 @@ class LocalToS3ZipManager:
     _s3_retrieval_max_attempts: int
     _s3_retrieval_retry_base_delay_sec: float
     _s3_retrieval_retry_max_delay_sec: float
+    _copy_queue_lease_timeout_sec: int
 
     def __init__(self,
                  s3_client: S3Client,
@@ -178,7 +184,8 @@ class LocalToS3ZipManager:
                  key_prefix: str = "",
                  s3_retrieval_max_attempts: int = DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
                  s3_retrieval_retry_base_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
-                 s3_retrieval_retry_max_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS):
+                 s3_retrieval_retry_max_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
+                 copy_queue_lease_timeout_sec: int = DEFAULT_COPY_QUEUE_LEASE_TIMEOUT_SECONDS):
         self._s3_client = s3_client
         self._bucket_name = bucket_name
         self._local_storage = local_storage
@@ -187,6 +194,7 @@ class LocalToS3ZipManager:
         self._s3_retrieval_max_attempts = max(1, int(s3_retrieval_max_attempts))
         self._s3_retrieval_retry_base_delay_sec = max(0.0, float(s3_retrieval_retry_base_delay_sec))
         self._s3_retrieval_retry_max_delay_sec = max(0.0, float(s3_retrieval_retry_max_delay_sec))
+        self._copy_queue_lease_timeout_sec = max(1, int(copy_queue_lease_timeout_sec))
         if enable_compression:
             self._zip_compression = zipfile.ZIP_DEFLATED
         else:
@@ -203,7 +211,8 @@ class LocalToS3ZipManager:
                      key_prefix=self._key_prefix or "<none>",
                      s3_retrieval_max_attempts=self._s3_retrieval_max_attempts,
                      s3_retrieval_retry_base_delay_sec=self._s3_retrieval_retry_base_delay_sec,
-                     s3_retrieval_retry_max_delay_sec=self._s3_retrieval_retry_max_delay_sec)
+                     s3_retrieval_retry_max_delay_sec=self._s3_retrieval_retry_max_delay_sec,
+                     copy_queue_lease_timeout_sec=self._copy_queue_lease_timeout_sec)
 
 
     def start(self):
@@ -275,48 +284,133 @@ class LocalToS3ZipManager:
     def schedule_copy_series_to_s3(self, series_id: str):
         logger.debug("enqueuing series for S3 copy", series_id=series_id)
         logger.debug("calling orthanc.EnqueueValue()", series_id=series_id)
-        orthanc.EnqueueValue("series-to-copy", series_id.encode('utf-8'))
+        orthanc.EnqueueValue(_COPY_QUEUE_NAME, series_id.encode('utf-8'))
         logger.debug("orthanc.EnqueueValue() returned", series_id=series_id)
         logger.debug("series enqueued for S3 copy", series_id=series_id)
 
 
     def _copy_thread_worker(self):
-        orthanc.SetCurrentThreadName("S3-COPY-THREAD")
-        logger.info("S3 copy thread started")
+        try:
+            orthanc.SetCurrentThreadName("S3-COPY-THREAD")
+        except BaseException as e:
+            self._log_copy_thread_exception("failed to set S3 copy thread name; continuing", e)
+        try:
+            logger.info("S3 copy thread started",
+                        copy_queue_lease_timeout_sec=self._copy_queue_lease_timeout_sec)
+        except BaseException:
+            pass
 
         while not self._threads_should_stop:
-            logger.debug("calling orthanc.ReserveQueueValue(series-to-copy)")
-            bseries_id, value_id = orthanc.ReserveQueueValue("series-to-copy", orthanc.QueueOrigin.FRONT, 600)
-            logger.debug("orthanc.ReserveQueueValue() returned",
-                         got_item=bseries_id is not None,
-                         value_id=str(value_id) if value_id is not None else "<none>")
-
-            if bseries_id is None:
-                logger.debug("no series in copy queue, sleeping")
-                time.sleep(1)
-            else:
-                series_id = bseries_id.decode('utf-8')
-                logger.debug("dequeued series for S3 copy",
-                             series_id=series_id,
-                             value_id=str(value_id))
-                logger.info("starting copy_series_to_s3", series_id=series_id)
+            try:
+                self._copy_thread_worker_once()
+            except BaseException as e:
+                self._log_copy_thread_exception("unhandled failure in S3 copy thread loop; continuing", e)
                 try:
-                    self.copy_series_to_s3(series_id=series_id)
-                except Exception as e:
-                    logger.warning("failed to copy series to S3, re-enqueuing",
-                                   series_id=series_id,
-                                   error=str(e))
-                    # TODO: identify if this is a "permanent failure".  In this case, no need to repost the message + handle max retries
-                    logger.debug("re-enqueuing failed series via orthanc.EnqueueValue()", series_id=series_id)
-                    orthanc.EnqueueValue("series-to-copy", bseries_id)
-                    logger.debug("orthanc.EnqueueValue() returned after re-enqueue", series_id=series_id)
-
-                logger.debug("calling orthanc.AcknowledgeQueueValue()", series_id=series_id, value_id=str(value_id))
-                orthanc.AcknowledgeQueueValue("series-to-copy", value_id)
-                logger.debug("orthanc.AcknowledgeQueueValue() returned", series_id=series_id)
-                logger.info("copy_series_to_s3 cycle complete", series_id=series_id)
+                    time.sleep(_COPY_QUEUE_IDLE_SLEEP_SECONDS)
+                except BaseException:
+                    pass
 
         logger.info("S3 copy thread exiting")
+
+
+    def _log_copy_thread_exception(self, message: str, exc: BaseException, **kwargs):
+        try:
+            logger.exception(message,
+                             error_type=type(exc).__name__,
+                             error=str(exc),
+                             **kwargs)
+        except BaseException:
+            try:
+                print(f"[s3zip] {message}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            except BaseException:
+                pass
+
+
+    def _copy_thread_worker_once(self):
+        logger.debug("calling orthanc.ReserveQueueValue(series-to-copy)",
+                     lease_timeout_sec=self._copy_queue_lease_timeout_sec)
+        bseries_id, value_id = orthanc.ReserveQueueValue(
+            _COPY_QUEUE_NAME,
+            orthanc.QueueOrigin.FRONT,
+            self._copy_queue_lease_timeout_sec,
+        )
+        logger.debug("orthanc.ReserveQueueValue() returned",
+                     got_item=bseries_id is not None,
+                     value_id=str(value_id) if value_id is not None else "<none>")
+
+        if bseries_id is None:
+            logger.debug("no series in copy queue, sleeping")
+            time.sleep(_COPY_QUEUE_IDLE_SLEEP_SECONDS)
+            return
+
+        if isinstance(bseries_id, str):
+            series_id = bseries_id
+        else:
+            try:
+                series_id = bseries_id.decode('utf-8')
+            except BaseException as e:
+                self._log_copy_thread_exception(
+                    "failed to decode series-to-copy queue value; acknowledging and continuing",
+                    e,
+                    value_id=str(value_id))
+                self._acknowledge_copy_queue_value(value_id=value_id, series_id="<decode failed>")
+                return
+
+        if not series_id:
+            self._log_copy_thread_exception(
+                "empty series id in series-to-copy queue value; acknowledging and continuing",
+                ValueError("empty series id"),
+                value_id=str(value_id))
+            self._acknowledge_copy_queue_value(value_id=value_id, series_id="<decode failed>")
+            return
+
+        logger.debug("dequeued series for S3 copy",
+                     series_id=series_id,
+                     value_id=str(value_id))
+        logger.info("starting copy_series_to_s3", series_id=series_id)
+
+        copy_succeeded = False
+        should_ack = True
+        try:
+            self.copy_series_to_s3(series_id=series_id)
+            copy_succeeded = True
+        except BaseException as e:
+            self._log_copy_thread_exception("failed to copy series to S3, re-enqueuing",
+                                            e,
+                                            series_id=series_id)
+            # TODO: identify if this is a "permanent failure".  In this case, no need to repost the message + handle max retries
+            try:
+                logger.debug("re-enqueuing failed series via orthanc.EnqueueValue()", series_id=series_id)
+                orthanc.EnqueueValue(_COPY_QUEUE_NAME, bseries_id)
+                logger.debug("orthanc.EnqueueValue() returned after re-enqueue", series_id=series_id)
+            except BaseException as requeue_error:
+                should_ack = False
+                self._log_copy_thread_exception(
+                    "failed to re-enqueue failed series; leaving reserved queue value unacknowledged for lease release",
+                    requeue_error,
+                    series_id=series_id,
+                    value_id=str(value_id))
+
+        if should_ack:
+            acknowledged = self._acknowledge_copy_queue_value(value_id=value_id, series_id=series_id)
+            if acknowledged and copy_succeeded:
+                logger.info("copy_series_to_s3 cycle complete", series_id=series_id)
+            elif acknowledged:
+                logger.info("failed copy re-enqueued and original queue value acknowledged", series_id=series_id)
+
+
+    def _acknowledge_copy_queue_value(self, value_id, series_id: str) -> bool:
+        try:
+            logger.debug("calling orthanc.AcknowledgeQueueValue()", series_id=series_id, value_id=str(value_id))
+            orthanc.AcknowledgeQueueValue(_COPY_QUEUE_NAME, value_id)
+            logger.debug("orthanc.AcknowledgeQueueValue() returned", series_id=series_id)
+            return True
+        except BaseException as e:
+            self._log_copy_thread_exception("failed to acknowledge series-to-copy queue value; continuing",
+                                            e,
+                                            series_id=series_id,
+                                            value_id=str(value_id))
+            return False
 
 
     def copy_series_to_s3(self, series_id: str):
@@ -378,8 +472,8 @@ class LocalToS3ZipManager:
         # before this series was uploaded). Without this guard the
         # first read_file call would raise FileNotFoundError, the
         # worker would re-enqueue, and the queue would spin every
-        # 600s for the life of the deployment. Acknowledge gracefully
-        # so the queue makes forward progress.
+        # copy queue lease for the life of the deployment. Acknowledge
+        # gracefully so the queue makes forward progress.
         #
         # The matching housekeeper pass detects this state and emits an
         # ERROR log of its own; we log here too so a missed copy is

@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 from boto3 import client as S3Client
 from local_storage import LocalStorage
 from local_to_s3_zip_manager import (
+    DEFAULT_COPY_QUEUE_LEASE_TIMEOUT_SECONDS,
     DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
     DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
     DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
@@ -73,6 +74,7 @@ class S3ZipStorage:
                  s3_retrieval_max_attempts: int = DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
                  s3_retrieval_retry_base_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
                  s3_retrieval_retry_max_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
+                 copy_queue_lease_timeout_sec: int = DEFAULT_COPY_QUEUE_LEASE_TIMEOUT_SECONDS,
                  housekeeper_interval_sec: float = DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS):
         logger.debug("initializing S3ZipStorage",
                      temp_folder=temporary_folder_root,
@@ -83,6 +85,7 @@ class S3ZipStorage:
                      s3_retrieval_max_attempts=s3_retrieval_max_attempts,
                      s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
                      s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec,
+                     copy_queue_lease_timeout_sec=copy_queue_lease_timeout_sec,
                      housekeeper_interval_sec=housekeeper_interval_sec)
 
         self._uncommitted_series_handler = UncommittedSeriesHandler()
@@ -98,7 +101,8 @@ class S3ZipStorage:
                                                 key_prefix=key_prefix,
                                                 s3_retrieval_max_attempts=s3_retrieval_max_attempts,
                                                 s3_retrieval_retry_base_delay_sec=s3_retrieval_retry_base_delay_sec,
-                                                s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec)
+                                                s3_retrieval_retry_max_delay_sec=s3_retrieval_retry_max_delay_sec,
+                                                copy_queue_lease_timeout_sec=copy_queue_lease_timeout_sec)
 
         # Set up the eviction guard: a folder is safe to evict only if it has the
         # .s3-uploaded marker file written by the copy thread after a successful S3 upload.
