@@ -29,6 +29,9 @@ logger = get_logger(__name__)
 # with slow stability timers is not constantly fighting the natural
 # copy path.
 _UNCOMMITTED_MIN_AGE_SEC = 5 * 60
+_BROKEN_STUDY_REUPLOAD_MESSAGE = (
+    "Study storage metadata is broken or incomplete; delete the study from Orthanc and re-upload it."
+)
 
 
 def _parse_uncommitted_entry_age_ms(raw_value, now_epoch_ms: int) -> int:
@@ -53,6 +56,13 @@ def _parse_uncommitted_entry_age_ms(raw_value, now_epoch_ms: int) -> int:
         return max(0, now_epoch_ms - stored_ms)
     except Exception:
         return now_epoch_ms
+
+
+def _custom_data_size(custom_data: bytes) -> int:
+    try:
+        return len(custom_data)
+    except Exception:
+        return -1
 
 
 class S3ZipStorage:
@@ -233,7 +243,14 @@ class S3ZipStorage:
                      range_start=range_start,
                      size=size)
 
-        cd: CustomData = CustomData.from_binary(custom_data)
+        cd: CustomData | None = self._load_custom_data_or_log_broken(
+            uuid=uuid,
+            content_type=content_type,
+            custom_data=custom_data,
+            operation="storage_read_range",
+        )
+        if cd is None:
+            return orthanc.ErrorCode.UNKNOWN_RESOURCE, None
 
         logger.debug("storage_read_range called",
                      uuid=uuid,
@@ -277,8 +294,9 @@ class S3ZipStorage:
                     else:
                         logger.error(
                             "instance marked as local but file is gone and no S3 key available. "
-                            "DATA LOSS: this instance cannot be retrieved.",
+                            f"{_BROKEN_STUDY_REUPLOAD_MESSAGE}",
                             uuid=uuid,
+                            series_id=cd.series_id or "<unknown>",
                             local_series_folder=cd.local_series_folder)
                         return orthanc.ErrorCode.UNKNOWN_RESOURCE, None
 
@@ -287,8 +305,21 @@ class S3ZipStorage:
                              s3_zip_key=s3_zip_key,
                              local_series_folder=cd.local_series_folder)
                 logger.debug("calling zip_manager.retrieve_zip_from_s3()", uuid=uuid, s3_zip_key=s3_zip_key)
-                self._zip_manager.retrieve_zip_from_s3(s3_zip_key=s3_zip_key,
-                                                       local_series_folder=cd.local_series_folder)
+                try:
+                    self._zip_manager.retrieve_zip_from_s3(s3_zip_key=s3_zip_key,
+                                                           local_series_folder=cd.local_series_folder)
+                except Exception as e:
+                    logger.error(
+                        "failed to retrieve backing S3 zip while reading instance. "
+                        f"{_BROKEN_STUDY_REUPLOAD_MESSAGE}",
+                        uuid=uuid,
+                        series_id=cd.series_id or "<unknown>",
+                        s3_zip_key=s3_zip_key,
+                        local_series_folder=cd.local_series_folder,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
+                    return orthanc.ErrorCode.UNKNOWN_RESOURCE, None
                 logger.debug("zip_manager.retrieve_zip_from_s3() returned", uuid=uuid)
                 logger.debug("series retrieved from S3 into local cache",
                              uuid=uuid,
@@ -312,6 +343,17 @@ class S3ZipStorage:
                      error_code=str(error_code),
                      bytes_read=len(data) if data else 0)
 
+        if error_code != orthanc.ErrorCode.SUCCESS:
+            logger.error(
+                "storage_read_range could not read instance bytes. "
+                f"{_BROKEN_STUDY_REUPLOAD_MESSAGE}",
+                uuid=uuid,
+                series_id=cd.series_id or "<unknown>",
+                local_series_folder=cd.local_series_folder,
+                s3_zip_key=cd.s3_zip_key or "<none>",
+                error_code=str(error_code),
+            )
+
         return result
 
     def storage_remove(self,
@@ -321,7 +363,22 @@ class S3ZipStorage:
 
         logger.debug("storage_remove entered", uuid=uuid, content_type=str(content_type))
 
-        cd = CustomData.from_binary(custom_data)
+        cd = self._load_custom_data_or_log_broken(
+            uuid=uuid,
+            content_type=content_type,
+            custom_data=custom_data,
+            operation="storage_remove",
+        )
+        if cd is None:
+            logger.error(
+                "storage_remove cannot map this attachment to local/S3 backing storage; "
+                "returning success so Orthanc can delete the DB resource. "
+                f"{_BROKEN_STUDY_REUPLOAD_MESSAGE}",
+                uuid=uuid,
+                content_type=str(content_type),
+                custom_data_size_bytes=_custom_data_size(custom_data),
+            )
+            return orthanc.ErrorCode.SUCCESS
 
         logger.debug("storage_remove called",
                      uuid=uuid,
@@ -331,18 +388,69 @@ class S3ZipStorage:
 
         # always delete from the local storage in case it has been stored there
         logger.debug("calling local_storage.remove()", uuid=uuid)
-        self._local_storage.remove(uuid=uuid,
-                                   local_series_folder=cd.local_series_folder,
-                                   content_type=content_type,
-                                   file_size=cd.size_in_bytes)
-        logger.debug("local_storage.remove() returned", uuid=uuid)
+        try:
+            self._local_storage.remove(uuid=uuid,
+                                       local_series_folder=cd.local_series_folder,
+                                       content_type=content_type,
+                                       file_size=cd.size_in_bytes)
+            logger.debug("local_storage.remove() returned", uuid=uuid)
+        except Exception as e:
+            logger.error(
+                "storage_remove failed to clean local backing file; returning success so Orthanc can delete "
+                "the DB resource. Any stale local file is best-effort cache garbage. "
+                f"{_BROKEN_STUDY_REUPLOAD_MESSAGE}",
+                uuid=uuid,
+                series_id=cd.series_id or "<unknown>",
+                local_series_folder=cd.local_series_folder,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
 
         if self._housekeeper_enabled and cd.series_id: # this only happens if the series has been uploaded into s3
-            orthanc.StoreKeyValue("series-ids-to-possibly-delete-from-s3", cd.series_id, custom_data) # cd.s3_zip_key.encode('utf-8') if cd.s3_zip_key else b'')
+            try:
+                orthanc.StoreKeyValue("series-ids-to-possibly-delete-from-s3", cd.series_id, custom_data) # cd.s3_zip_key.encode('utf-8') if cd.s3_zip_key else b'')
+            except Exception as e:
+                logger.error(
+                    "storage_remove could not schedule S3 zip cleanup; returning success so Orthanc can delete "
+                    "the DB resource. A later re-upload of the same series will overwrite the S3 zip key; "
+                    "otherwise this may leave an orphaned S3 object.",
+                    uuid=uuid,
+                    series_id=cd.series_id,
+                    s3_zip_key=cd.s3_zip_key or "<none>",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+        elif self._housekeeper_enabled:
+            logger.warning(
+                "storage_remove custom data has no series id; S3 zip cleanup cannot be scheduled, "
+                "but Orthanc DB deletion will continue. "
+                f"{_BROKEN_STUDY_REUPLOAD_MESSAGE}",
+                uuid=uuid,
+                local_series_folder=cd.local_series_folder,
+                s3_zip_key=cd.s3_zip_key or "<none>",
+            )
 
         logger.debug("storage_remove completed", uuid=uuid)
 
         return orthanc.ErrorCode.SUCCESS
+
+    def _load_custom_data_or_log_broken(self,
+                                        uuid: str,
+                                        content_type: orthanc.ContentType,
+                                        custom_data: bytes,
+                                        operation: str) -> Optional[CustomData]:
+        try:
+            return CustomData.from_binary(custom_data)
+        except Exception as e:
+            logger.error(
+                f"{operation}: invalid S3Zip CustomData. {_BROKEN_STUDY_REUPLOAD_MESSAGE}",
+                uuid=uuid,
+                content_type=str(content_type),
+                custom_data_size_bytes=_custom_data_size(custom_data),
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            return None
 
 
     def schedule_copy_series_to_s3(self, series_id: str):

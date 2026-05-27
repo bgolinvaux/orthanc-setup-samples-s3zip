@@ -7,12 +7,16 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from typing import List, Dict, Optional, Tuple
+
 from boto3 import client as S3Client
+
 from local_storage_interface import LocalStorageInterface
 from uncommitted_series_handler import UncommittedSeriesHandler
 from custom_data import CustomData
+
 from s3zip_logging import get_logger
 
 try:
@@ -27,6 +31,8 @@ DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS = 0.5
 DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS = 5.0
 DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS = 60.0
 DEFAULT_COPY_QUEUE_LEASE_TIMEOUT_SECONDS = 1800
+
+CUSTOM_DATA_CREATION_NUM_THREADS = 12
 
 _COPY_QUEUE_NAME = "series-to-copy"
 _COPY_QUEUE_IDLE_SLEEP_SECONDS = 1
@@ -576,7 +582,7 @@ class LocalToS3ZipManager:
                             s3_key=s3_key)
                 t_meta_start = time.monotonic()
 
-                for idx, a_uuid in enumerate(attachments_uuids):
+                def set_attachment_custom_data(a_uuid: str, idx: int) -> None:
                     logger.debug("calling orthanc.SetAttachmentCustomData()",
                                  series_id=series_id,
                                  uuid=a_uuid,
@@ -594,6 +600,16 @@ class LocalToS3ZipManager:
                                  series_id=series_id,
                                  uuid=a_uuid,
                                  index=idx)
+
+                with ThreadPoolExecutor(max_workers=CUSTOM_DATA_CREATION_NUM_THREADS) as executor:
+                    futures  = [
+                        executor.submit(set_attachment_custom_data, a_uuid, idx)
+                        for idx, a_uuid in enumerate(attachments_uuids)
+                    ]
+
+                    # Wait for all tasks to complete and propagate any exceptions
+                    for future in futures:
+                        future.result()
 
                 t_meta_done = time.monotonic()
                 logger.info("SetAttachmentCustomData loop complete",
