@@ -32,6 +32,10 @@ _UNCOMMITTED_MIN_AGE_SEC = 5 * 60
 _BROKEN_STUDY_REUPLOAD_MESSAGE = (
     "Study storage metadata is broken or incomplete; delete the study from Orthanc and re-upload it."
 )
+_SUPPORTED_ATTACHMENT_CONTENT_TYPES = {
+    1,  # ContentType.DICOM
+    3,  # ContentType.DICOM_UNTIL_PIXEL_DATA
+}
 
 
 def _parse_uncommitted_entry_age_ms(raw_value, now_epoch_ms: int) -> int:
@@ -150,8 +154,8 @@ class S3ZipStorage:
         self._zip_manager.start()
 
         if self._housekeeper_enabled:
-            logger.debug(f"Starting housekeeper with an interval of {self._housekeeper_interval_sec} sec")
-            self.perform_housekeeping()  # and it will repeat
+            logger.debug(f"Scheduling housekeeper with an interval of {self._housekeeper_interval_sec} sec")
+            self._schedule_housekeeping()
         else:
             logger.debug(f"NOT starting housekeeper")
 
@@ -481,8 +485,11 @@ class S3ZipStorage:
             logger.exception("Housekeeper: unexpected error during run; rescheduling anyway")
         finally:
             # reschedule
-            self._housekeeper_timer = threading.Timer(self._housekeeper_interval_sec, self.perform_housekeeping)
-            self._housekeeper_timer.start()
+            self._schedule_housekeeping()
+
+    def _schedule_housekeeping(self):
+        self._housekeeper_timer = threading.Timer(self._housekeeper_interval_sec, self.perform_housekeeping)
+        self._housekeeper_timer.start()
 
     def _perform_housekeeping(self):
         logger.debug("Performing housekeeping")
@@ -753,10 +760,11 @@ class S3ZipStorage:
         # Count how many instances still have at least one attachment file
         # on local disk. ``has_local_file`` is cheap (an os.path.exists)
         # so it is safe to call for every instance.
-        instances_with_local_file, total_probed, first_local_folder = self._probe_instance_local_files(
+        instances_with_local_file, total_probed, first_local_folder, probe_failed = self._probe_instance_local_files(
             series_id=series_id,
-            instances=instances,
         )
+        if probe_failed:
+            return
 
         # Three branches, all of which schedule a copy. The copy thread
         # has its own fast-path guard that ack's without re-enqueueing
@@ -819,32 +827,62 @@ class S3ZipStorage:
                 series_id=series_id,
             )
 
-    def _probe_instance_local_files(self, series_id: str, instances):
-        """Return (instances_with_local_file, total_probed, first_local_folder).
+    def _probe_instance_local_files(self, series_id: str):
+        """Return local-file probe counts plus whether the probe was incomplete.
 
         ``total_probed`` counts only the instances we could actually
-        inspect (skipping malformed entries / attachments we could not
-        resolve). The caller can therefore safely compare it against
-        ``instances_with_local_file`` for the all/partial/none decision
-        without a separate "probe failed" branch in the main flow.
+        inspect. If any probe error occurs, this emits one summary log line
+        for the series and returns ``probe_failed=True`` so the caller can
+        leave the KVS entry untouched for a later pass.
         """
+        try:
+            instances_info = self._get_series_attachments_for_probe(series_id=series_id)
+        except Exception as e:
+            logger.warning(
+                "Housekeeper: attachment probe failed for series; pausing retries",
+                series_id=series_id,
+                instances_seen=0,
+                probe_failures=1,
+                first_failed_instance_id="<bulk-query>",
+                sample_error=f"{type(e).__name__}: {e}",
+            )
+            return 0, 0, None, True
+
         instances_with_local_file = 0
         total_probed = 0
         first_local_folder = None
+        instances_seen = 0
+        probe_errors: list[tuple[str, str]] = []
 
-        for instance in instances:
+        for instance in instances_info:
+            instances_seen += 1
             instance_id = instance.get("ID") if isinstance(instance, dict) else None
-            if not instance_id:
+            attachments = instance.get("Attachments") if isinstance(instance, dict) else None
+            if not instance_id or not isinstance(attachments, list):
+                probe_errors.append((
+                    instance_id or "<unknown>",
+                    "ValueError: malformed /tools/find instance attachment response",
+                ))
                 continue
-            try:
-                attachment_uuids = self._first_attachment_uuids_for_instance(instance_id)
-            except Exception:
-                logger.exception(
-                    "Housekeeper: failed to inspect instance attachments; skipping for probe count",
-                    series_id=series_id,
-                    instance_id=instance_id,
-                )
-                continue
+
+            attachment_uuids = []
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    probe_errors.append((
+                        instance_id,
+                        "ValueError: malformed attachment entry",
+                    ))
+                    continue
+                if attachment.get("ContentType") not in _SUPPORTED_ATTACHMENT_CONTENT_TYPES:
+                    continue
+                a_uuid = attachment.get("Uuid")
+                if a_uuid:
+                    attachment_uuids.append(a_uuid)
+                else:
+                    probe_errors.append((
+                        instance_id,
+                        "ValueError: supported attachment is missing Uuid",
+                    ))
 
             if not attachment_uuids:
                 # An instance with no attachments doesn't participate in
@@ -855,7 +893,11 @@ class S3ZipStorage:
             for a_uuid in attachment_uuids:
                 try:
                     cd = CustomData.from_orthanc_attachment(attachment_uuid=a_uuid)
-                except Exception:
+                except Exception as e:
+                    probe_errors.append((
+                        instance_id,
+                        f"{type(e).__name__}: {e}",
+                    ))
                     cd = None
                 if cd is None:
                     continue
@@ -869,46 +911,38 @@ class S3ZipStorage:
                     ):
                         instances_with_local_file += 1
                         break
-                except Exception:
-                    logger.exception(
-                        "Housekeeper: has_local_file probe failed; treating attachment as missing",
-                        series_id=series_id,
-                        attachment_uuid=a_uuid,
-                    )
+                except Exception as e:
+                    probe_errors.append((
+                        instance_id,
+                        f"{type(e).__name__}: {e}",
+                    ))
 
-        return instances_with_local_file, total_probed, first_local_folder
+        if probe_errors:
+            first_failed_instance_id, sample_error = probe_errors[0]
+            logger.warning(
+                "Housekeeper: attachment probe failed for series; pausing retries",
+                series_id=series_id,
+                instances_seen=instances_seen,
+                probe_failures=len(probe_errors),
+                first_failed_instance_id=first_failed_instance_id,
+                sample_error=sample_error,
+            )
+            return instances_with_local_file, total_probed, first_local_folder, True
 
-    def _first_attachment_uuids_for_instance(self, instance_id: str):
+        return instances_with_local_file, total_probed, first_local_folder, False
+
+    def _get_series_attachments_for_probe(self, series_id: str):
         payload = {
             "Level": "Instance",
             "Query": {},
             "ResponseContent": ["Attachments"],
-            "ParentInstance": instance_id,
+            "ParentSeries": series_id,
         }
-        # /tools/find with ParentInstance is brittle; the direct
-        # /instances/<id>/attachments?full endpoint gives the same info in
-        # a single call without scanning siblings.
-        raw = orthanc.RestApiGet(f"/instances/{instance_id}/attachments?full")
-        attachments = json.loads(raw) if raw else {}
-        # attachments is a dict {"dicom": <content_type_int>, ...}.
-        # We need the per-content-type UUIDs, which are exposed via the
-        # /info endpoint per attachment name.
-        out = []
-        for name in attachments.keys():
-            try:
-                info_raw = orthanc.RestApiGet(f"/instances/{instance_id}/attachments/{name}/info")
-                info = json.loads(info_raw) if info_raw else {}
-                a_uuid = info.get("Uuid")
-                if a_uuid:
-                    out.append(a_uuid)
-            except Exception:
-                # One bad attachment is not fatal -- keep collecting the others.
-                logger.debug(
-                    "Housekeeper: could not read attachment info",
-                    instance_id=instance_id,
-                    attachment_name=name,
-                )
-        return out
+        raw = orthanc.RestApiPost("/tools/find", json.dumps(payload).encode("utf-8"))
+        instances_info = json.loads(raw) if raw else []
+        if not isinstance(instances_info, list):
+            raise ValueError("/tools/find did not return a list")
+        return instances_info
 
     def _safe_delete_kvs_entry(self, kvs_name: str, key: str) -> None:
         try:
