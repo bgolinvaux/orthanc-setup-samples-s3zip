@@ -18,6 +18,7 @@ from uncommitted_series_handler import UncommittedSeriesHandler
 from custom_data import CustomData
 
 from s3zip_logging import get_logger
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from botocore import exceptions as botocore_exceptions
