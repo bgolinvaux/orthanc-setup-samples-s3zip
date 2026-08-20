@@ -532,9 +532,10 @@ class S3ZipStorage:
         return self._zip_manager.get_series_info(series_id=series_id)
 
 
-    def get_s3_zip_stream(self, series_id: str):  # returns a stream
-        logger.debug("retrieving a series S3 zip stream", series_id=series_id)
-        return self._zip_manager.get_s3_zip_stream(series_id=series_id)
+    def download_series_zip(self, series_id: str, destination_path: str) -> None:
+        logger.debug("downloading a series S3 zip", series_id=series_id)
+        self._zip_manager.download_series_zip(series_id=series_id,
+                                              destination_path=destination_path)
 
     def perform_housekeeping(self):
         self._housekeeper_timer = None

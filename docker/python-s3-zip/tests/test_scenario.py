@@ -6,11 +6,13 @@ from orthanc_api_client.helpers import wait_until
 from orthanc_tools import OrthancTestDbPopulator
 import time
 import boto3
+import io
 import sys
 import os
 import threading
 import hashlib
 import pprint
+import zipfile
 from botocore.exceptions import ClientError
 from contextlib import contextmanager
 from python_on_whales import DockerClient
@@ -257,14 +259,29 @@ if not wait_until(lambda: zip_orthanc.get_json(endpoint=f'series/{series_id}/s3-
 series_status = zip_orthanc.get_json(endpoint=f'series/{series_id}/s3-zip/status')
 print(f"s3-zip-key = {series_status.get('s3-zip-key')}")
 
-print("Downloading directly from S3 through the Orthanc REST Api override of /series/.../archive")
+print("Downloading from S3 through the Orthanc REST Api override of /series/.../archive")
 series_zip = zip_orthanc.get_binary(endpoint=f'series/{series_id}/archive')
-zip_size_on_s3 = get_zip_size_on_s3(series_id=series_id)
-if len(series_zip) != zip_size_on_s3:
-    print(f"Retrieved zip does not have the same size as the zip on s3 ({len(series_zip)} vs {zip_size_on_s3} )")
+
+# The archive is built from the zip on S3, not forwarded from it: the members
+# of the stored zip are named after the Orthanc attachment uuid, and what a
+# user unzips has to look like DICOM. So the sizes no longer match -- what
+# must match is the number of instances, and every file must end in .dcm.
+instance_count_in_series = len(zip_orthanc.get_json(endpoint=f'series/{series_id}')['Instances'])
+with zipfile.ZipFile(io.BytesIO(series_zip)) as downloaded_zip:
+    downloaded_names = downloaded_zip.namelist()
+
+if len(downloaded_names) != instance_count_in_series:
+    print(f"Retrieved zip holds {len(downloaded_names)} file(s) for a series of "
+          f"{instance_count_in_series} instance(s)")
     exit(-3)
-else:
-    print(f"Retrieved zip from /series/.../archive (size = {len(series_zip)})")
+
+not_dicom = [name for name in downloaded_names if not name.lower().endswith('.dcm')]
+if not_dicom:
+    print(f"Retrieved zip contains file(s) that are not named as DICOM files: {not_dicom[:10]}")
+    exit(-3)
+
+print(f"Retrieved zip from /series/.../archive (size = {len(series_zip)}, "
+      f"files = {len(downloaded_names)}, all named *.dcm)")
 
 print("---------------- Test new API routes on zip Orthanc - done ----------------")
 

@@ -3,6 +3,7 @@ import json
 import zipfile
 import os
 import random
+import shutil
 import sys
 import tempfile
 import threading
@@ -38,6 +39,14 @@ DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS = 300.0
 DEFAULT_COPY_QUEUE_LEASE_TIMEOUT_SECONDS = 1800
 
 CUSTOM_DATA_CREATION_NUM_THREADS = 12
+
+# The extension every DICOM file carries in an archive Orthanc hands to a
+# human. See dicom_archive_member_name() for why the zips on S3 do not use it.
+DICOM_FILE_EXTENSION = ".dcm"
+
+# Chunk size used when copying one member of a zip into another. It bounds the
+# memory an archive download costs, whatever the size of the series.
+ARCHIVE_COPY_CHUNK_SIZE = 1024 * 1024
 
 _COPY_QUEUE_NAME = "series-to-copy"
 _COPY_QUEUE_IDLE_SLEEP_SECONDS = 1
@@ -101,6 +110,78 @@ else:
 # rotated away before anyone looked. A KVS entry survives, can be listed, and
 # gives the Gap Server a truthful answer to "is this study whole?".
 LOST_DATA_KVS = "s3zip-series-with-lost-data"
+
+
+def dicom_archive_member_name(member_name: str) -> str:
+    """Return the name a zip member must carry in a user-facing archive.
+
+    Inside the zips this plugin stores on S3, a member is named after the
+    Orthanc attachment uuid and nothing else. That is the storage format, and
+    it must stay that way: ``_retrieve_zip_from_s3_once`` maps a member name
+    straight back to a uuid when it rebuilds a local folder, and every zip
+    already sitting in a bucket is named that way.
+
+    It is the wrong name to hand to a human. Unzipping such an archive yields
+    a pile of extension-less files that no DICOM viewer offers to open, while
+    every other archive Orthanc produces -- study, patient, and any series not
+    yet on S3, which the core still builds itself -- is full of ``.dcm``. That
+    inconsistency is QM-9928; the fix is to rename on the way out, at the only
+    place where the archive is a download rather than a storage artefact.
+    """
+    if member_name.lower().endswith(DICOM_FILE_EXTENSION):
+        return member_name
+
+    return member_name + DICOM_FILE_EXTENSION
+
+
+def write_dicom_named_archive(source_zip_path: str, destination) -> int:
+    """Copy the zip at ``source_zip_path`` into ``destination``, naming every
+    member as a DICOM file. Returns the number of members copied.
+
+    ``destination`` only has to offer ``write`` and ``tell``. Given no
+    ``seek``, ``zipfile`` writes a data descriptor after each member instead of
+    going back to patch its header -- which is what makes this usable as the
+    body of a chunked HTTP answer.
+
+    Members are copied one at a time and in chunks, so a download costs one
+    ``ARCHIVE_COPY_CHUNK_SIZE`` buffer rather than one series. Compression
+    method, timestamps and attributes are carried over from the source; the
+    data itself is decompressed and re-compressed on the way through (the
+    stdlib has no raw member copy), so the two archives are equivalent member
+    for member rather than byte for byte.
+    """
+    members_written = 0
+
+    with zipfile.ZipFile(source_zip_path, "r") as source_zip:
+        with zipfile.ZipFile(destination, "w", allowZip64=True) as destination_zip:
+            for member in source_zip.infolist():
+                if member.is_dir():
+                    # The plugin never writes one, but a zip that carries a
+                    # directory entry must not turn it into a DICOM file.
+                    continue
+
+                target = zipfile.ZipInfo(filename=dicom_archive_member_name(member.filename),
+                                         date_time=member.date_time)
+                target.compress_type = member.compress_type
+                target.create_system = member.create_system
+                target.external_attr = member.external_attr
+                target.internal_attr = member.internal_attr
+                # zipfile decides the local header layout from this, and on a
+                # non-seekable destination it cannot revisit that decision:
+                # a member above the ZIP64 limit has to be declared as such
+                # before its first byte is streamed.
+                target.file_size = member.file_size
+
+                with source_zip.open(member, "r") as source_member:
+                    with destination_zip.open(
+                            target,
+                            "w",
+                            force_zip64=member.file_size >= zipfile.ZIP64_LIMIT) as target_member:
+                        shutil.copyfileobj(source_member, target_member, ARCHIVE_COPY_CHUNK_SIZE)
+
+                members_written += 1
+
+    return members_written
 
 
 class SeriesS3Info:
@@ -1214,15 +1295,40 @@ class LocalToS3ZipManager:
                                    s3_zip_key=zip_retrieval.series_id)
 
 
-    def get_s3_zip_stream(self, series_id: str):  # returns a stream
-        logger.info("series zip stream from S3",
-                    series_id=series_id)
+    def download_series_zip(self, series_id: str, destination_path: str) -> None:
+        """Download the series' S3 zip to ``destination_path``.
 
+        This deliberately completes before it returns rather than handing back
+        an open stream: the archive endpoint has to re-pack the zip anyway (see
+        write_dicom_named_archive), and doing the download first leaves it a
+        window in which a missing or unreadable S3 object is still an HTTP
+        error code instead of a truncated 200.
+
+        The object is fetched with a single GetObject rather than
+        ``download_file`` on purpose. Above the multipart threshold the
+        transfer manager splits a download into several ranged GETs, and the
+        key being downloaded is one the copy thread legitimately overwrites
+        (a re-upload after new instances arrived) -- ranged GETs that straddle
+        that overwrite stitch two different zips into one corrupt file. A
+        single GET is served from exactly one object version, whatever its
+        size.
+        """
         s3_zip_key = self._get_series_s3_key(series_id=series_id)
 
-        response =  self._s3_client.get_object(Bucket=self._bucket_name,
-                                               Key=s3_zip_key)
-        return response['Body']
+        logger.info("downloading a series zip from S3",
+                    series_id=series_id,
+                    s3_zip_key=s3_zip_key,
+                    bucket=self._bucket_name,
+                    destination_path=destination_path)
+
+        response = self._s3_client.get_object(Bucket=self._bucket_name,
+                                              Key=s3_zip_key)
+        body = response["Body"]
+        try:
+            with open(destination_path, "wb") as destination:
+                shutil.copyfileobj(body, destination, ARCHIVE_COPY_CHUNK_SIZE)
+        finally:
+            body.close()
 
 
     def _rehydrate_and_reread(self, series_id: str, a_uuid: str, local_series_folder: str) -> bytes:

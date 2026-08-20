@@ -2,11 +2,13 @@ import sys
 import orthanc
 import json
 import os
+import tempfile
 import boto3
 import uuid as uuid_module
 from typing import Tuple, Optional
 from s3_zip_storage import S3ZipStorage
 from local_to_s3_zip_manager import (
+    write_dicom_named_archive,
     DEFAULT_COPY_QUEUE_LEASE_TIMEOUT_SECONDS,
     DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS,
     DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
@@ -159,41 +161,83 @@ def on_rest_api_series_s3_status(output, uri, **request):  # GET -> returns a st
         output.SendMethodNotAllowed('GET')
 
 
-def on_rest_api_series_s3_archive(output, uri, **request): # GET -> streams a zip from s3 through Orthanc (if not in s3, get it from Orthanc core API (without streaming))
-    global storage_singleton
-    if request['method'] == 'GET':
-        series_id = request['groups'][0]
+class _OrthancStreamAnswerWriter:
+    """Minimal write-only file object that pushes into an Orthanc stream answer.
 
-        series_status = storage_singleton.get_series_status(series_id=series_id)
-        if not series_status:
-            # No attachment to serve. Answering before StartStreamAnswer is the
-            # only chance to send a status code -- once the stream is open the
-            # client gets a 200 followed by a traceback's worth of nothing.
-            logger.error("cannot stream the archive of a series with no attachment",
-                         series_id=series_id)
-            output.SendHttpStatusCode(404)
-            return
+    ``zipfile`` needs no more than ``write`` and ``tell`` from a destination.
+    Not offering ``seek`` is deliberate: it makes zipfile emit a data
+    descriptor after each member instead of rewinding to patch its header,
+    which is the only way to produce a valid zip that has already left the
+    process chunk by chunk.
+    """
+
+    def __init__(self, output):
+        self._output = output
+        self._offset = 0
+
+    def write(self, data) -> int:
+        chunk = bytes(data)
+        if chunk:
+            self._output.SendStreamChunk(chunk)
+            self._offset += len(chunk)
+        return len(chunk)
+
+    def tell(self) -> int:
+        return self._offset
+
+    def flush(self) -> None:
+        pass
+
+
+def on_rest_api_series_s3_archive(output, uri, **request): # GET -> streams a zip built from the series' S3 zip (if not in s3, get it from Orthanc core API (without streaming))
+    global storage_singleton
+    if request['method'] != 'GET':
+        output.SendMethodNotAllowed('GET')
+        return
+
+    series_id = request['groups'][0]
+
+    series_status = storage_singleton.get_series_status(series_id=series_id)
+    if not series_status:
+        # No attachment to serve. Answering before StartStreamAnswer is the
+        # only chance to send a status code -- once the stream is open the
+        # client gets a 200 followed by a traceback's worth of nothing.
+        logger.error("cannot stream the archive of a series with no attachment",
+                     series_id=series_id)
+        output.SendHttpStatusCode(404)
+        return
+
+    if not series_status.is_stored_in_s3:
+        # Nothing on S3 yet: the core still has every instance on disk and
+        # builds the archive itself, hierarchy and .dcm names included.
+        logger.info("getting series archive from core", series_id=series_id)
+        zip = orthanc.RestApiGet(uri)
+        output.SetHttpHeader('Content-Disposition', f'filename={series_id}.zip')
+        output.StartStreamAnswer('application/zip')
+        output.SendStreamChunk(zip)
+        return
+
+    # The zip on S3 cannot be forwarded as-is: its members are named after the
+    # attachment uuid, so what the user unzips has no .dcm anywhere (QM-9928).
+    # It is re-packed on the way out instead -- member by member, straight into
+    # the HTTP stream, so a large series costs a temporary file and one buffer
+    # rather than its own weight in RAM.
+    #
+    # The download completes BEFORE StartStreamAnswer, which is what keeps a
+    # failing S3 read reportable as an HTTP error.
+    with tempfile.NamedTemporaryFile(suffix=".zip") as tmp_zip:
+        storage_singleton.download_series_zip(series_id=series_id,
+                                              destination_path=tmp_zip.name)
 
         output.SetHttpHeader('Content-Disposition', f'filename={series_id}.zip')
         output.StartStreamAnswer('application/zip')
 
-        if series_status.is_stored_in_s3:
-            logger.info("streaming series archive from s3")
-            zip_stream = storage_singleton.get_s3_zip_stream(series_id=series_id)
-
-            while True:
-                chunk = zip_stream.read(64*1024)
-                if not chunk:
-                    return
-
-                output.SendStreamChunk(chunk)
-        else:
-            logger.info("getting series archive from core")
-            zip = orthanc.RestApiGet(uri)
-            output.SendStreamChunk(zip)
-
-    else:
-        output.SendMethodNotAllowed('GET')
+        logger.info("streaming series archive from the S3 zip", series_id=series_id)
+        instance_count = write_dicom_named_archive(source_zip_path=tmp_zip.name,
+                                                   destination=_OrthancStreamAnswerWriter(output))
+        logger.info("series archive streamed",
+                    series_id=series_id,
+                    instance_count=instance_count)
 
 
 def on_rest_api_local_cache_stats(output, uri, **request):

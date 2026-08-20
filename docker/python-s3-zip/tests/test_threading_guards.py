@@ -1,4 +1,5 @@
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -91,7 +92,11 @@ from local_to_s3_zip_manager import (
     _COPY_QUEUE_MAX_DEFERRALS_BEFORE_IDLE,
     LOST_DATA_KVS,
     LocalToS3ZipManager,
+    SeriesS3Info,
+    dicom_archive_member_name,
+    write_dicom_named_archive,
 )
+import s3_zip_storage_plugin
 from s3_zip_storage import (
     DELETED_SERIES_KVS,
     _HOUSEKEEPER_MAX_INSTANCES_PROBED_PER_SERIES,
@@ -2767,6 +2772,263 @@ class HousekeeperShutdownTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertTrue(captured[0].daemon)
         captured[0].start.assert_called_once()
+
+
+class _RecordingOutput:
+    """Stand-in for the Orthanc RestOutput given to a REST callback.
+
+    It records the calls in order, because the order is the point: nothing may
+    be streamed before the plugin knows it can serve the whole archive.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.headers = {}
+        self.body = bytearray()
+
+    def SetHttpHeader(self, name, value):
+        self.calls.append(("SetHttpHeader", name))
+        self.headers[name] = value
+
+    def StartStreamAnswer(self, mime):
+        self.calls.append(("StartStreamAnswer", mime))
+
+    def SendStreamChunk(self, chunk):
+        self.calls.append(("SendStreamChunk", len(chunk)))
+        self.body += chunk
+
+    def SendHttpStatusCode(self, code):
+        self.calls.append(("SendHttpStatusCode", code))
+
+    def SendMethodNotAllowed(self, allowed):
+        self.calls.append(("SendMethodNotAllowed", allowed))
+
+
+class _ArchiveStorageStub:
+    """Enough of S3ZipStorage for the archive endpoint."""
+
+    def __init__(self, series_status, zip_bytes=None, download_error=None):
+        self._series_status = series_status
+        self._zip_bytes = zip_bytes
+        self._download_error = download_error
+        self.downloads = []
+
+    def get_series_status(self, series_id):
+        return self._series_status
+
+    def download_series_zip(self, series_id, destination_path):
+        self.downloads.append(series_id)
+        if self._download_error is not None:
+            raise self._download_error
+        with open(destination_path, "wb") as f:
+            f.write(self._zip_bytes)
+
+
+class _WriteAndTellOnly:
+    """A destination offering exactly what the Orthanc stream answer offers."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+
+    def write(self, data):
+        self.buffer += bytes(data)
+        return len(data)
+
+    def tell(self):
+        return len(self.buffer)
+
+    def flush(self):
+        pass
+
+
+def _build_zip(members, compression=zipfile.ZIP_DEFLATED):
+    path = tempfile.mkstemp(suffix=".zip")[1]
+    with zipfile.ZipFile(path, "w", compression=compression) as z:
+        for name, content in members.items():
+            z.writestr(name, content)
+    with open(path, "rb") as f:
+        raw = f.read()
+    os.remove(path)
+    return raw
+
+
+class DicomArchiveNamingTests(unittest.TestCase):
+    """QM-9928: what a user unzips must look like DICOM, wherever it came from.
+
+    The S3 zips name their members after the attachment uuid -- that is the
+    storage format and it stays -- so the archive endpoint has to rename on the
+    way out. Everything below is about that rename being complete, lossless,
+    and safe to perform on a connection that has already been answered.
+    """
+
+    def test_member_name_gains_the_dicom_extension_exactly_once(self):
+        self.assertEqual(dicom_archive_member_name("6b2f1c9a-uuid"), "6b2f1c9a-uuid.dcm")
+        self.assertEqual(dicom_archive_member_name("already.dcm"), "already.dcm")
+        # A name Orthanc itself produced (upper case is legal DICOM practice)
+        # must not be given a second extension either.
+        self.assertEqual(dicom_archive_member_name("IMG00001.DCM"), "IMG00001.DCM")
+
+    def test_every_member_is_renamed_and_its_bytes_survive(self):
+        members = {
+            "aaaaaaaa-1111-2222-3333-444444444444": b"DICM" + os.urandom(4096),
+            "bbbbbbbb-5555-6666-7777-888888888888": b"DICM" + b"\x00" * 70000,
+        }
+        source = tempfile.mkstemp(suffix=".zip")[1]
+        try:
+            with open(source, "wb") as f:
+                f.write(_build_zip(members))
+
+            destination = _WriteAndTellOnly()
+            written = write_dicom_named_archive(source_zip_path=source,
+                                                destination=destination)
+
+            self.assertEqual(written, len(members))
+            with zipfile.ZipFile(io.BytesIO(bytes(destination.buffer))) as result:
+                self.assertIsNone(result.testzip())
+                self.assertEqual(sorted(result.namelist()),
+                                 sorted(name + ".dcm" for name in members))
+                for name, content in members.items():
+                    self.assertEqual(result.read(name + ".dcm"), content)
+        finally:
+            os.remove(source)
+
+    def test_compression_of_each_member_is_carried_over(self):
+        # A plugin configured with EnableCompression=false stores its members;
+        # re-packing must not silently start deflating (or vice versa), because
+        # that would turn every archive download into a full re-compression.
+        for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(compression=compression):
+                source = tempfile.mkstemp(suffix=".zip")[1]
+                try:
+                    with open(source, "wb") as f:
+                        f.write(_build_zip({"uuid-1": b"x" * 5000},
+                                           compression=compression))
+
+                    destination = _WriteAndTellOnly()
+                    write_dicom_named_archive(source_zip_path=source,
+                                              destination=destination)
+
+                    with zipfile.ZipFile(io.BytesIO(bytes(destination.buffer))) as result:
+                        self.assertEqual(result.infolist()[0].compress_type, compression)
+                finally:
+                    os.remove(source)
+
+    def test_download_series_zip_is_one_get_object_written_to_the_destination(self):
+        # A single GetObject, never the transfer manager's download_file: the
+        # latter splits a large object into parallel ranged GETs, and this key
+        # is one the copy thread legitimately overwrites (re-upload after new
+        # instances) -- ranged GETs straddling that overwrite stitch two
+        # different zips into one corrupt download. One GET is served from
+        # exactly one object version.
+        payload = _build_zip({"uuid-1": b"DICM" + b"x" * 20000})
+
+        class _Body:
+            def __init__(self, data):
+                self._stream = io.BytesIO(data)
+                self.closed = False
+
+            def read(self, amt=None):
+                return self._stream.read(amt)
+
+            def close(self):
+                self.closed = True
+
+        class _GetObjectOnlyS3Client:
+            def __init__(self):
+                self.get_object_calls = []
+                self.body = _Body(payload)
+
+            def get_object(self, Bucket, Key):
+                self.get_object_calls.append((Bucket, Key))
+                return {"Body": self.body}
+
+            # No download_file on purpose: reaching for it must fail loudly.
+
+        s3_client = _GetObjectOnlyS3Client()
+        manager = LocalToS3ZipManager(
+            s3_client=s3_client,
+            bucket_name="bucket",
+            local_storage=object(),
+            enable_compression=False,
+            uncommitted_series_handler=object(),
+            key_prefix="prefix",
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".zip") as destination:
+            manager.download_series_zip(series_id="series",
+                                        destination_path=destination.name)
+            with open(destination.name, "rb") as f:
+                self.assertEqual(f.read(), payload)
+
+        self.assertEqual(s3_client.get_object_calls, [("bucket", "prefix/series.zip")])
+        self.assertTrue(s3_client.body.closed)
+
+    def test_archive_endpoint_streams_a_renamed_copy_of_the_s3_zip(self):
+        members = {"cccccccc-9999-0000-1111-222222222222": b"DICM" + os.urandom(2048)}
+        status = SeriesS3Info(series_id="series")
+        status.is_stored_in_s3 = True
+        storage = _ArchiveStorageStub(series_status=status, zip_bytes=_build_zip(members))
+        output = _RecordingOutput()
+
+        with mock.patch.object(s3_zip_storage_plugin, "storage_singleton", storage):
+            s3_zip_storage_plugin.on_rest_api_series_s3_archive(
+                output, "/series/series/archive", method="GET", groups=["series"])
+
+        self.assertEqual(storage.downloads, ["series"])
+        with zipfile.ZipFile(io.BytesIO(bytes(output.body))) as result:
+            self.assertEqual(result.namelist(),
+                             ["cccccccc-9999-0000-1111-222222222222.dcm"])
+            self.assertEqual(result.read("cccccccc-9999-0000-1111-222222222222.dcm"),
+                             members["cccccccc-9999-0000-1111-222222222222"])
+
+    def test_a_failed_s3_download_is_still_reportable_as_an_error(self):
+        # Once StartStreamAnswer has been called the client is committed to a
+        # 200 and a failure can only look like a truncated -- but valid-looking
+        # -- download. So the whole zip is fetched first.
+        status = SeriesS3Info(series_id="series")
+        status.is_stored_in_s3 = True
+        storage = _ArchiveStorageStub(series_status=status,
+                                      download_error=RuntimeError("S3 is down"))
+        output = _RecordingOutput()
+
+        with mock.patch.object(s3_zip_storage_plugin, "storage_singleton", storage):
+            with self.assertRaises(RuntimeError):
+                s3_zip_storage_plugin.on_rest_api_series_s3_archive(
+                    output, "/series/series/archive", method="GET", groups=["series"])
+
+        self.assertEqual(output.calls, [])
+
+    def test_a_series_not_yet_on_s3_is_still_served_by_the_core(self):
+        status = SeriesS3Info(series_id="series")
+        status.is_stored_in_s3 = False
+        storage = _ArchiveStorageStub(series_status=status)
+        output = _RecordingOutput()
+
+        with mock.patch.object(s3_zip_storage_plugin, "storage_singleton", storage):
+            with mock.patch.object(orthanc_stub, "RestApiGet", return_value=b"core-zip"):
+                s3_zip_storage_plugin.on_rest_api_series_s3_archive(
+                    output, "/series/series/archive", method="GET", groups=["series"])
+
+        self.assertEqual(storage.downloads, [])
+        self.assertEqual(bytes(output.body), b"core-zip")
+
+    def test_a_series_with_no_attachment_is_a_404(self):
+        storage = _ArchiveStorageStub(series_status=None)
+        output = _RecordingOutput()
+
+        with mock.patch.object(s3_zip_storage_plugin, "storage_singleton", storage):
+            s3_zip_storage_plugin.on_rest_api_series_s3_archive(
+                output, "/series/series/archive", method="GET", groups=["series"])
+
+        self.assertEqual(output.calls, [("SendHttpStatusCode", 404)])
+
+    def test_only_get_is_accepted(self):
+        output = _RecordingOutput()
+
+        s3_zip_storage_plugin.on_rest_api_series_s3_archive(
+            output, "/series/series/archive", method="POST", groups=["series"])
+
+        self.assertEqual(output.calls, [("SendMethodNotAllowed", "GET")])
 
 
 if __name__ == "__main__":

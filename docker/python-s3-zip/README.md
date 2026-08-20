@@ -59,6 +59,38 @@ has nothing to evict. The budget is a target rather than a wall — writes are
 admitted past it, and the filesystem is the hard limit (an `ENOSPC` write
 fails the C-STORE, which is what makes the modality retry).
 
+## `GET /series/<id>/archive`
+
+This is the only archive route the plugin overrides, and the only one it needs
+to: the study- and patient-level archives are built by the Orthanc core, which
+reads every instance back through the storage plugin.
+
+Two things are worth knowing about it.
+
+**The zip on S3 is never forwarded as-is.** Inside it, a member is named after
+the Orthanc attachment uuid and carries no extension — that is the storage
+format, and `_retrieve_zip_from_s3_once` maps a member name straight back to a
+uuid when it rebuilds a local folder. Handing that to a browser gave the user a
+pile of extension-less files out of a *series* download, while the same series
+downloaded before its copy to S3, or downloaded as part of its study, came out
+as `.dcm`. The archive is therefore re-packed on the way out
+(`write_dicom_named_archive`): every member is renamed to `<uuid>.dcm` and
+re-encoded with its original compression method (the stdlib offers no raw
+member copy), and the result is pushed into the HTTP answer member by member —
+so a large series costs one temporary file and one 1 MB buffer, not its own
+weight in RAM.
+
+**The download from S3 completes before the answer is started.** Once
+`StartStreamAnswer` has been called the client is committed to a `200`, and a
+failure downstream of that point is indistinguishable from a short download. So
+the object is fetched first: an S3 outage comes back as an error code. The
+fetch is a single `GetObject` rather than the transfer manager's
+`download_file`: the latter splits a large object into parallel ranged GETs,
+and this key is one the copy thread legitimately overwrites (a re-upload after
+new instances arrived) — ranged GETs straddling that overwrite would stitch two
+different zips into one corrupt download. One GET is served from exactly one
+object version.
+
 # TODO
 
 ## Making sure all series are uploaded to S3
