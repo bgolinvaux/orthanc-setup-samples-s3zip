@@ -128,10 +128,12 @@ class S3ZipStorage:
                  s3_retrieval_retry_base_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_BASE_DELAY_SECONDS,
                  s3_retrieval_retry_max_delay_sec: float = DEFAULT_S3_RETRIEVAL_RETRY_MAX_DELAY_SECONDS,
                  copy_queue_lease_timeout_sec: int = DEFAULT_COPY_QUEUE_LEASE_TIMEOUT_SECONDS,
-                 housekeeper_interval_sec: float = DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS):
+                 housekeeper_interval_sec: float = DEFAULT_HOUSEKEEPER_INTERVAL_SECONDS,
+                 temp_folder_over_eviction_mb: int = 0):
         logger.debug("initializing S3ZipStorage",
                      temp_folder=temporary_folder_root,
                      max_size_mb=temp_folder_max_size_mb,
+                     over_eviction_mb=temp_folder_over_eviction_mb,
                      bucket=bucket_name,
                      compression=enable_compression,
                      key_prefix=key_prefix or "<none>",
@@ -144,7 +146,8 @@ class S3ZipStorage:
         self._uncommitted_series_handler = UncommittedSeriesHandler()
 
         self._local_storage: LocalStorage = LocalStorage(root=temporary_folder_root,
-                                           max_size_mb=temp_folder_max_size_mb)
+                                           max_size_mb=temp_folder_max_size_mb,
+                                           over_eviction_mb=temp_folder_over_eviction_mb)
 
         self._zip_manager = LocalToS3ZipManager(s3_client=s3_client,
                                                 bucket_name=bucket_name,
@@ -190,6 +193,25 @@ class S3ZipStorage:
     def get_local_cache_stats(self) -> dict:
         """Return a snapshot of local-cache occupancy without triggering eviction."""
         return self._local_storage.get_cache_summary()
+
+    def get_eviction_stats(self) -> dict:
+        """Return the make-room diagnostic counters (QM-10227). No scan, no eviction."""
+        return self._local_storage.get_eviction_stats()
+
+    def reset_eviction_stats(self) -> dict:
+        """Start a new observation window for the eviction counters; returns the fresh snapshot."""
+        return self._local_storage.reset_eviction_stats()
+
+    def get_local_cache_budget(self) -> dict:
+        """The local-cache budget and over-eviction headroom currently in force."""
+        return self._local_storage.get_budget()
+
+    def set_local_cache_budget(self,
+                               max_size_mb: Optional[int] = None,
+                               over_eviction_mb: Optional[int] = None) -> dict:
+        """Change the budget and/or headroom at runtime, in memory only (QM-10227)."""
+        return self._local_storage.set_budget(max_size_mb=max_size_mb,
+                                              over_eviction_mb=over_eviction_mb)
 
     def start(self):
         logger.debug("starting S3ZipStorage manager")

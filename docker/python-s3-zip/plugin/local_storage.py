@@ -35,6 +35,60 @@ class EvictionResult:
     freed_bytes: int
     skipped_folders: int
     available_bytes_after: int
+    # Bytes held by the folders the pass looked at and refused to delete
+    # (leased, not yet on S3, or whose deletion failed). Diagnostic only.
+    skipped_bytes: int = 0
+
+
+@dataclass
+class _EvictionCounters:
+    """Diagnostic counters behind ``GET /s3-zip/local-cache/eviction-stats`` (QM-10227).
+
+    They exist so that a test, or an operator reading the endpoint, can check
+    that the over-eviction headroom does its job without knowing how fast the
+    disk is: how many writes came in, how many of them paid for an eviction
+    pass, how much each pass freed and how far under the budget it landed.
+    Every field is read and written under ``LocalStorage._lock``;
+    ``LocalStorage.reset_eviction_stats()`` starts a new observation window.
+    """
+    since_epoch: float = 0.0
+    # write_file() calls, i.e. instances landing in the cache (C-STORE and
+    # rehydration alike), and the bytes they reserved.
+    write_count: int = 0
+    write_bytes: int = 0
+    fast_path_count: int = 0
+    cooldown_admission_count: int = 0
+    # Every `du` over the cache: startup, make-room passes, admin evictions
+    # and stats snapshots.
+    du_count: int = 0
+    du_seconds_total: float = 0.0
+    du_seconds_max: float = 0.0
+    # Make-room passes (the slow path), classified by where they landed:
+    # at or past the over-eviction target, under budget but short of the
+    # target, or still over budget. "futile" passes freed nothing at all.
+    pass_count: int = 0
+    pass_reached_target_count: int = 0
+    pass_under_budget_short_of_target_count: int = 0
+    pass_over_budget_count: int = 0
+    pass_futile_count: int = 0
+    # Wall time the writer that triggered the pass was stalled: waiting for
+    # in-flight writes, the du, and the deletions.
+    pass_seconds_total: float = 0.0
+    pass_seconds_max: float = 0.0
+    pass_min_available_after_reached_target: Optional[int] = None
+    pass_min_available_after: Optional[int] = None
+    pass_max_available_after: Optional[int] = None
+    evicted_folders: int = 0
+    evicted_bytes: int = 0
+    evicted_bytes_max_in_pass: int = 0
+    # headroom = max_size - bytes the pass may not delete (pending + leased),
+    # measured at each pass: the best a pass could possibly reach.
+    headroom_min_bytes: Optional[int] = None
+    headroom_max_bytes: Optional[int] = None
+    admin_eviction_count: int = 0
+    admin_evicted_folders: int = 0
+    admin_evicted_bytes: int = 0
+
 
 logger = get_logger(__name__)
 
@@ -125,6 +179,15 @@ class LocalStorage(LocalStorageInterface):
 
     _root: str
     _max_size: int    # all sizes are in [bytes]
+    # QM-10227: how much of the budget a make-room pass leaves free. The pass
+    # is triggered when a write would take the cache over `_max_size` and it
+    # runs until `_over_eviction_bytes` are free, i.e. down to
+    # `_max_size - _over_eviction_bytes`, so the next pass -- and the next
+    # full-cache `du` it starts with -- only comes once ingest has used that
+    # headroom up, instead of on the very next write. 0 keeps the pass
+    # stopping the moment the triggering write fits. The headroom lives
+    # inside the budget; nothing here lets the cache go above `_max_size`.
+    _over_eviction_bytes: int
     _available_size: int
     _block_size: int
     _lock: threading.RLock
@@ -137,10 +200,12 @@ class LocalStorage(LocalStorageInterface):
     _folder_stats: queue.PriorityQueue[FolderStatEntry]
     _is_folder_safe_to_evict: Callable[[str], bool] | None
     _futile_eviction_until: float
+    _counters: _EvictionCounters
 
-    def __init__(self, root: str, max_size_mb: int) -> None:
+    def __init__(self, root: str, max_size_mb: int, over_eviction_mb: int = 0) -> None:
         self._root = root
         self._max_size = max_size_mb * 1024 * 1024
+        self._over_eviction_bytes = self._clamp_over_eviction_bytes(over_eviction_mb * 1024 * 1024)
         self._lock = threading.RLock()
         self._io_condition = threading.Condition()
         self._active_writers = 0
@@ -150,13 +215,36 @@ class LocalStorage(LocalStorageInterface):
         self._folder_marker_cs_locks = {}
         self._is_folder_safe_to_evict = None
         self._futile_eviction_until = 0.0
+        self._counters = _EvictionCounters(since_epoch=time.time())
 
         self._update_local_storage_stats()
 
         logger.debug("LocalStorage initialized",
                      root=root,
                      max_size_mb=max_size_mb,
-                     max_size_bytes=self._max_size)
+                     max_size_bytes=self._max_size,
+                     over_eviction_mb=over_eviction_mb,
+                     over_eviction_bytes=self._over_eviction_bytes)
+
+    def _clamp_over_eviction_bytes(self, over_eviction_bytes: int) -> int:
+        """Validate an over-eviction headroom against the current budget.
+
+        Negative is a configuration error. Larger than the budget is legal --
+        it means "every pass drains everything evictable" -- but the target
+        `available >= headroom` could then never be met, which would make the
+        pass statistics lie, so it is clamped to the budget with a warning.
+        """
+        if over_eviction_bytes < 0:
+            raise ValueError(f"OverEvictionMB must be >= 0, got {over_eviction_bytes} bytes")
+        if over_eviction_bytes > self._max_size:
+            logger.warning(
+                "LocalStorage: OverEvictionMB is larger than LocalStorageMaxSizeMB; "
+                "clamping it to the budget (every eviction pass will drain everything evictable)",
+                over_eviction_bytes=over_eviction_bytes,
+                max_size_bytes=self._max_size,
+            )
+            return self._max_size
+        return over_eviction_bytes
 
     def set_eviction_guard(self, is_folder_safe_to_evict: Callable[[str], bool]) -> None:
         """
@@ -352,7 +440,9 @@ class LocalStorage(LocalStorageInterface):
         folder_stats: queue.PriorityQueue[FolderStatEntry] = queue.PriorityQueue()
 
         cmd: List[str] = ["du", "-b", "--max-depth=1", self._root]
+        du_started: float = time.monotonic()
         du_stdout: str = self._run_du_capture(cmd)
+        du_seconds: float = time.monotonic() - du_started
         lines: List[str] = du_stdout.strip().split("\n")
 
         total_folders: int = 0
@@ -376,6 +466,9 @@ class LocalStorage(LocalStorageInterface):
             self._block_size = block_size
             self._folder_stats = folder_stats
             self._available_size = self._max_size - total_apparent_bytes - self._reserved_bytes
+            self._counters.du_count += 1
+            self._counters.du_seconds_total += du_seconds
+            self._counters.du_seconds_max = max(self._counters.du_seconds_max, du_seconds)
 
             logger.debug(
                 "LocalStorage: disk stats refreshed",
@@ -390,6 +483,7 @@ class LocalStorage(LocalStorageInterface):
                 available_bytes=self._available_size,
                 available_mb=round(self._available_size / (1024 * 1024), 2),
                 prev_available_bytes=prev_available,
+                du_seconds=round(du_seconds, 3),
             )
 
 
@@ -512,7 +606,72 @@ class LocalStorage(LocalStorageInterface):
             freed_bytes=freed_bytes,
             skipped_folders=len(skipped),
             available_bytes_after=self._available_size,
+            skipped_bytes=sum(entry[2] for entry in skipped),
         )
+
+    def _protected_bytes_locked(self) -> int:
+        """Bytes in the folders an eviction pass may not delete right now.
+
+        Leased folders plus the folders the eviction guard refuses (no
+        ``.s3-uploaded`` marker). ``max_size - protected`` is the headroom a
+        pass can reach at best: below the over-eviction target the pass cannot
+        meet its target whatever it deletes, and below zero the pending set
+        alone is over budget. One ``exists()`` per series folder, right after
+        a ``du`` that walked every one of them, so the dentries are warm.
+        Caller MUST hold ``self._lock``.
+        """
+        protected: int = 0
+        for _last_modified, path, folder_size in list(self._folder_stats.queue):
+            folder_name: str = os.path.basename(path)
+            if self._get_folder_lease_count(folder_name) > 0:
+                protected += folder_size
+                continue
+            if self._is_folder_safe_to_evict is None:
+                continue
+            try:
+                safe = self._is_folder_safe_to_evict(folder_name)
+            except Exception:
+                safe = False
+            if not safe:
+                protected += folder_size
+        return protected
+
+    def _record_pass_locked(self,
+                            result: EvictionResult,
+                            target_available_bytes: int,
+                            protected_bytes: int,
+                            pass_seconds: float) -> None:
+        """Fold one make-room pass into the diagnostic counters. Caller MUST hold ``self._lock``."""
+        c: _EvictionCounters = self._counters
+        after: int = result.available_bytes_after
+
+        c.pass_count += 1
+        c.pass_seconds_total += pass_seconds
+        c.pass_seconds_max = max(c.pass_seconds_max, pass_seconds)
+
+        if after >= target_available_bytes:
+            c.pass_reached_target_count += 1
+            c.pass_min_available_after_reached_target = (
+                after if c.pass_min_available_after_reached_target is None
+                else min(c.pass_min_available_after_reached_target, after)
+            )
+        elif after >= 0:
+            c.pass_under_budget_short_of_target_count += 1
+        else:
+            c.pass_over_budget_count += 1
+        if result.freed_bytes == 0:
+            c.pass_futile_count += 1
+
+        c.pass_min_available_after = after if c.pass_min_available_after is None else min(c.pass_min_available_after, after)
+        c.pass_max_available_after = after if c.pass_max_available_after is None else max(c.pass_max_available_after, after)
+
+        c.evicted_folders += result.freed_folders
+        c.evicted_bytes += result.freed_bytes
+        c.evicted_bytes_max_in_pass = max(c.evicted_bytes_max_in_pass, result.freed_bytes)
+
+        headroom: int = self._max_size - protected_bytes
+        c.headroom_min_bytes = headroom if c.headroom_min_bytes is None else min(c.headroom_min_bytes, headroom)
+        c.headroom_max_bytes = headroom if c.headroom_max_bytes is None else max(c.headroom_max_bytes, headroom)
 
     def _make_room(self, size: int) -> int:
         reservation_size: int = max(size, 0)
@@ -520,6 +679,8 @@ class LocalStorage(LocalStorageInterface):
         with self._lock:
             self._available_size -= reservation_size
             self._reserved_bytes += reservation_size
+            self._counters.write_count += 1
+            self._counters.write_bytes += reservation_size
 
             logger.debug(
                 "LocalStorage: _make_room called",
@@ -531,6 +692,7 @@ class LocalStorage(LocalStorageInterface):
             )
 
             if self._available_size >= 0:
+                self._counters.fast_path_count += 1
                 logger.debug(
                     "LocalStorage: fast path - sufficient space, no eviction needed",
                     available_after_bytes=self._available_size,
@@ -543,6 +705,7 @@ class LocalStorage(LocalStorageInterface):
                 # A recent pass already established that nothing here is
                 # evictable. Admit the write without re-scanning; see
                 # _FUTILE_EVICTION_COOLDOWN_SEC.
+                self._counters.cooldown_admission_count += 1
                 logger.debug(
                     "LocalStorage: over budget but a recent eviction pass freed nothing; "
                     "admitting the write without re-scanning",
@@ -560,6 +723,9 @@ class LocalStorage(LocalStorageInterface):
             )
 
         scan_paused = False
+        # Measured from here: the wall time this writer -- and, once the scan
+        # slot is taken, every other writer -- is stalled by the pass.
+        pass_started: float = time.monotonic()
         try:
             self._pause_writes_for_scan()
             scan_paused = True
@@ -571,12 +737,22 @@ class LocalStorage(LocalStorageInterface):
             )
 
             with self._lock:
+                # QM-10227: the pass evicts until `_over_eviction_bytes` are
+                # free, not until the triggering write merely fits. With a
+                # zero target every write past the budget re-ran the full
+                # cache `du` above, because each pass freed one series and the
+                # next write was over budget again. The trigger is unchanged
+                # (available < 0); only the target moves, and the warning and
+                # futile cooldown below still key on the hard budget.
+                target_available_bytes: int = self._over_eviction_bytes
+
                 logger.debug(
                     "LocalStorage: starting eviction loop",
                     reservation_bytes=reservation_size,
                     available_after_refresh_bytes=self._available_size,
                     reserved_bytes=self._reserved_bytes,
                     folders_queued=self._folder_stats.qsize(),
+                    target_available_bytes=target_available_bytes,
                 )
 
                 # Reclaim space -- evict oldest folders first, but protect folders
@@ -584,17 +760,29 @@ class LocalStorage(LocalStorageInterface):
                 # This can be useful if the plugin receives a burst of uploads that
                 # exceed the local storage capacity, but the S3 upload process is
                 # still catching up
-                result = self._evict_until(target_available_bytes=0)
+                result = self._evict_until(target_available_bytes=target_available_bytes)
 
-                logger.debug(
-                    "LocalStorage: eviction loop complete",
+                protected_bytes: int = self._protected_bytes_locked()
+                pass_seconds: float = time.monotonic() - pass_started
+                self._record_pass_locked(result, target_available_bytes, protected_bytes, pass_seconds)
+
+                # INFO: passes are meant to be rare now, and one line per pass
+                # is what lets an operator see the headroom at work (or not).
+                logger.info(
+                    "LocalStorage: eviction pass complete",
                     freed_folders=result.freed_folders,
                     freed_bytes=result.freed_bytes,
+                    freed_mb=round(result.freed_bytes / (1024 * 1024), 2),
                     skipped_folders=result.skipped_folders,
+                    protected_bytes=protected_bytes,
+                    protected_mb=round(protected_bytes / (1024 * 1024), 2),
+                    target_available_bytes=target_available_bytes,
+                    reached_target=self._available_size >= target_available_bytes,
                     reservation_bytes=reservation_size,
                     reserved_bytes=self._reserved_bytes,
                     available_after_eviction_bytes=self._available_size,
                     available_after_eviction_mb=round(self._available_size / (1024 * 1024), 2),
+                    pass_seconds=round(pass_seconds, 3),
                 )
 
                 if self._available_size < 0:
@@ -622,6 +810,7 @@ class LocalStorage(LocalStorageInterface):
                             _FUTILE_EVICTION_COOLDOWN_SEC if result.freed_bytes == 0 else 0
                         ),
                         max_size_mb=self._max_size // (1024 * 1024),
+                        over_eviction_bytes=self._over_eviction_bytes,
                     )
                 else:
                     self._futile_eviction_until = 0.0
@@ -702,6 +891,10 @@ class LocalStorage(LocalStorageInterface):
             with self._lock:
                 result = self._evict_until(target_available_bytes=None)
 
+                self._counters.admin_eviction_count += 1
+                self._counters.admin_evicted_folders += result.freed_folders
+                self._counters.admin_evicted_bytes += result.freed_bytes
+
                 if result.freed_bytes > 0:
                     # Something became evictable, so the "nothing to free"
                     # conclusion that paused the make-room rescans no longer
@@ -757,6 +950,7 @@ class LocalStorage(LocalStorageInterface):
                 used_bytes: int = self._max_size - self._available_size
                 return {
                     "max_bytes": self._max_size,
+                    "over_eviction_bytes": self._over_eviction_bytes,
                     "available_bytes": self._available_size,
                     "used_bytes": used_bytes,
                     "reserved_bytes": self._reserved_bytes,
@@ -767,6 +961,132 @@ class LocalStorage(LocalStorageInterface):
                 }
         finally:
             self._resume_writes_after_scan()
+
+    def get_eviction_stats(self) -> Dict[str, Any]:
+        """Snapshot of the make-room diagnostic counters (QM-10227).
+
+        Pure bookkeeping: no scan, no eviction, no I/O. See
+        ``_EvictionCounters`` for what each group means.
+        """
+        def _avg(total: float, count: int) -> float:
+            return total / count if count else 0.0
+
+        with self._lock:
+            c: _EvictionCounters = self._counters
+            return {
+                "since_epoch": round(c.since_epoch, 3),
+                "window_seconds": round(time.time() - c.since_epoch, 3),
+                "config": {
+                    "max_bytes": self._max_size,
+                    "over_eviction_bytes": self._over_eviction_bytes,
+                    # The cache size right after a pass that reached its
+                    # target, and the largest pending set for which a pass can
+                    # still reach it.
+                    "effective_threshold_bytes": self._max_size - self._over_eviction_bytes,
+                    "available_bytes": self._available_size,
+                    "reserved_bytes": self._reserved_bytes,
+                },
+                "writes": {
+                    "count": c.write_count,
+                    "bytes": c.write_bytes,
+                    "avg_bytes": round(_avg(c.write_bytes, c.write_count)),
+                    "fast_path": c.fast_path_count,
+                    "admitted_during_cooldown": c.cooldown_admission_count,
+                    "slow_path": c.pass_count,
+                },
+                "du": {
+                    "count": c.du_count,
+                    "seconds_total": round(c.du_seconds_total, 3),
+                    "seconds_max": round(c.du_seconds_max, 3),
+                    "seconds_avg": round(_avg(c.du_seconds_total, c.du_count), 3),
+                },
+                "passes": {
+                    "count": c.pass_count,
+                    "reached_target": c.pass_reached_target_count,
+                    "under_budget_short_of_target": c.pass_under_budget_short_of_target_count,
+                    "over_budget": c.pass_over_budget_count,
+                    "futile": c.pass_futile_count,
+                    "seconds_total": round(c.pass_seconds_total, 3),
+                    "seconds_max": round(c.pass_seconds_max, 3),
+                    "seconds_avg": round(_avg(c.pass_seconds_total, c.pass_count), 3),
+                    "min_available_after_reached_target_bytes": c.pass_min_available_after_reached_target,
+                    "min_available_after_bytes": c.pass_min_available_after,
+                    "max_available_after_bytes": c.pass_max_available_after,
+                },
+                "evictions": {
+                    "folders": c.evicted_folders,
+                    "bytes": c.evicted_bytes,
+                    "avg_bytes_per_pass": round(_avg(c.evicted_bytes, c.pass_count)),
+                    "avg_bytes_per_folder": round(_avg(c.evicted_bytes, c.evicted_folders)),
+                    "max_bytes_in_pass": c.evicted_bytes_max_in_pass,
+                },
+                "headroom": {
+                    "min_bytes": c.headroom_min_bytes,
+                    "max_bytes": c.headroom_max_bytes,
+                },
+                "admin_evictions": {
+                    "count": c.admin_eviction_count,
+                    "folders": c.admin_evicted_folders,
+                    "bytes": c.admin_evicted_bytes,
+                },
+            }
+
+    def reset_eviction_stats(self) -> Dict[str, Any]:
+        """Start a new observation window for ``get_eviction_stats``; returns the fresh snapshot."""
+        with self._lock:
+            self._counters = _EvictionCounters(since_epoch=time.time())
+            logger.info("LocalStorage: eviction stats reset")
+            return self.get_eviction_stats()
+
+    def get_budget(self) -> Dict[str, int]:
+        """The budget and over-eviction headroom in force, in the config's MB units and in bytes."""
+        with self._lock:
+            return {
+                "LocalStorageMaxSizeMB": self._max_size // (1024 * 1024),
+                "OverEvictionMB": self._over_eviction_bytes // (1024 * 1024),
+                "max_bytes": self._max_size,
+                "over_eviction_bytes": self._over_eviction_bytes,
+                "available_bytes": self._available_size,
+            }
+
+    def set_budget(self,
+                   max_size_mb: Optional[int] = None,
+                   over_eviction_mb: Optional[int] = None) -> Dict[str, int]:
+        """Change the budget and/or the over-eviction headroom at runtime (QM-10227).
+
+        Backs ``PUT /s3-zip/local-cache/budget``. Nothing is rescanned:
+        ``_available_size`` is ``budget - bytes on disk - reserved``, so a new
+        budget moves it by the difference. Nothing is evicted here either; a
+        smaller budget takes effect on the next write, which finds itself over
+        budget and runs a pass. The futile-pass cooldown is cleared so that
+        write does rescan rather than coast on a conclusion drawn under the
+        old budget. The change lives in memory only: a restart goes back to
+        the configuration file.
+        """
+        with self._lock:
+            if max_size_mb is not None:
+                if max_size_mb < 0:
+                    raise ValueError(f"LocalStorageMaxSizeMB must be >= 0, got {max_size_mb}")
+                new_max_size: int = max_size_mb * 1024 * 1024
+                self._available_size += new_max_size - self._max_size
+                self._max_size = new_max_size
+            if over_eviction_mb is not None:
+                self._over_eviction_bytes = self._clamp_over_eviction_bytes(over_eviction_mb * 1024 * 1024)
+            elif self._over_eviction_bytes > self._max_size:
+                # The budget shrank under a headroom set earlier.
+                self._over_eviction_bytes = self._clamp_over_eviction_bytes(self._over_eviction_bytes)
+            self._futile_eviction_until = 0.0
+
+            logger.info(
+                "LocalStorage: budget changed at runtime",
+                max_size_mb=self._max_size // (1024 * 1024),
+                max_size_bytes=self._max_size,
+                over_eviction_mb=self._over_eviction_bytes // (1024 * 1024),
+                over_eviction_bytes=self._over_eviction_bytes,
+                available_bytes=self._available_size,
+                available_mb=round(self._available_size / (1024 * 1024), 2),
+            )
+            return self.get_budget()
 
 
     def write_file(self, local_series_folder: str, uuid: str, content: bytes) -> None:

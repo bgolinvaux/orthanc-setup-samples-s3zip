@@ -567,6 +567,368 @@ class SpacePressureTests(unittest.TestCase):
             self.assertEqual(storage._available_size, available_before + 1000)
 
 
+class OverEvictionTests(unittest.TestCase):
+    """QM-10227: a make-room pass leaves ``OverEvictionMB`` of the budget free.
+
+    With a zero headroom every write past the budget pays for a pass -- and
+    the full-cache ``du`` it starts with -- because the pass stops the moment
+    the triggering write fits, and the next write is over budget again. With
+    a headroom, consecutive passes are separated by at least that many bytes
+    of ingest. These tests pin the arithmetic on a cache of equal-sized,
+    already-uploaded folders, and the counters that report it.
+    """
+
+    KiB = 1024
+    MiB = 1024 * 1024
+    FOLDER_BYTES = 256 * KiB
+    WRITE_BYTES = 64 * KiB
+
+    def _uploaded_folders(self, root, count):
+        # `count` evictable folders (empty marker so the fake du sees exactly
+        # FOLDER_BYTES each), oldest first so the LRU order is deterministic.
+        for i in range(count):
+            folder = os.path.join(root, f"series-{i:02d}")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "instance"), "wb") as f:
+                _ = f.write(b"x" * self.FOLDER_BYTES)
+            with open(os.path.join(folder, ".s3-uploaded"), "w") as f:
+                pass
+            os.utime(folder, (1_000_000 + i, 1_000_000 + i))
+
+    def _storage(self, root, max_size_mb, over_eviction_mb):
+        with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_walk(root)):
+            storage = LocalStorage(root=root, max_size_mb=max_size_mb,
+                                   over_eviction_mb=over_eviction_mb)
+        storage.set_eviction_guard(
+            lambda name: os.path.exists(os.path.join(root, name, ".s3-uploaded"))
+        )
+        return storage
+
+    def _write(self, storage, root, uuid, folder="incoming"):
+        with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_walk(root)):
+            storage.write_file(local_series_folder=folder, uuid=uuid,
+                               content=b"y" * self.WRITE_BYTES)
+
+    def _full_cache(self, root, over_eviction_mb):
+        # 8 x 256 KiB of uploaded series = exactly the 2 MiB budget, so the
+        # first write is over budget.
+        self._uploaded_folders(root, count=8)
+        return self._storage(root, max_size_mb=2, over_eviction_mb=over_eviction_mb)
+
+    def test_pass_evicts_until_the_headroom_is_free(self):
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._full_cache(root, over_eviction_mb=1)
+
+            self._write(storage, root, "u-0")
+
+            # -64 KiB after the reservation; five folders (1.25 MiB) are the
+            # fewest that bring it to >= 1 MiB. With a zero headroom one
+            # folder would have done.
+            self.assertEqual(storage._available_size, 5 * self.FOLDER_BYTES - self.WRITE_BYTES)
+            self.assertEqual(
+                sorted(n for n in os.listdir(root) if n.startswith("series-")),
+                ["series-05", "series-06", "series-07"],
+                "the five OLDEST folders must go",
+            )
+
+            stats = storage.get_eviction_stats()
+            self.assertEqual(stats["config"]["over_eviction_bytes"], self.MiB)
+            self.assertEqual(stats["config"]["effective_threshold_bytes"], self.MiB)
+            self.assertEqual(stats["passes"]["count"], 1)
+            self.assertEqual(stats["passes"]["reached_target"], 1)
+            self.assertGreaterEqual(stats["passes"]["min_available_after_reached_target_bytes"], self.MiB)
+            self.assertEqual(stats["evictions"]["folders"], 5)
+            self.assertEqual(stats["evictions"]["bytes"], 5 * self.FOLDER_BYTES)
+            self.assertEqual(stats["evictions"]["max_bytes_in_pass"], 5 * self.FOLDER_BYTES)
+            # Constructor scan + the pass.
+            self.assertEqual(stats["du"]["count"], 2)
+            self.assertEqual(stats["writes"]["count"], 1)
+            self.assertEqual(stats["writes"]["bytes"], self.WRITE_BYTES)
+            self.assertEqual(stats["writes"]["slow_path"], 1)
+            # Nothing was pending when the pass ran (the incoming folder is
+            # created by the write, after make_room), so the whole budget was
+            # reachable.
+            self.assertEqual(stats["headroom"]["max_bytes"], 2 * self.MiB)
+            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB)
+
+    def test_headroom_spaces_out_the_scans(self):
+        # Same workload, 16 writes of 64 KiB into a full cache. Without a
+        # headroom a pass frees one 256 KiB folder, which pays for four
+        # writes, so 16 writes cost four scans. With a 1 MiB headroom the
+        # first pass leaves 1.19 MiB free and the other fifteen writes
+        # (0.94 MiB) never scan.
+        def passes_for(over_eviction_mb):
+            with tempfile.TemporaryDirectory() as root:
+                storage = self._full_cache(root, over_eviction_mb=over_eviction_mb)
+                for i in range(16):
+                    self._write(storage, root, f"u-{i}")
+                stats = storage.get_eviction_stats()
+                self.assertEqual(stats["writes"]["count"], 16)
+                self.assertEqual(stats["writes"]["fast_path"] + stats["writes"]["slow_path"], 16)
+                return stats["passes"]["count"], stats["du"]["count"]
+
+        passes_without, du_without = passes_for(0)
+        passes_with, du_with = passes_for(1)
+
+        self.assertEqual(passes_without, 4)
+        self.assertEqual(passes_with, 1)
+        # One du per pass, plus the constructor's.
+        self.assertEqual(du_without, passes_without + 1)
+        self.assertEqual(du_with, passes_with + 1)
+
+    def test_pass_classification_and_hard_budget_semantics(self):
+        # Three passes over the life of one incoming series, each landing
+        # somewhere else:
+        #   1. reaches the 1 MiB target (evictable data to spare);
+        #   2. under budget but short of the target (only 0.75 MiB left to
+        #      evict): NO warning cooldown, the write proceeds;
+        #   3. over budget with nothing evictable: the futile cooldown, as
+        #      before this change.
+        # The headroom measured at each pass is the budget minus what the
+        # incoming (pending) folder holds at that moment.
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._full_cache(root, over_eviction_mb=1)
+
+            # Pass 1: write #1. Then 19 fast writes bring available to 0.
+            for i in range(20):
+                self._write(storage, root, f"u-{i}")
+            self.assertEqual(storage._available_size, 0)
+            self.assertEqual(storage.get_eviction_stats()["passes"]["count"], 1)
+
+            # Pass 2: write #21 -> -64 KiB; 3 folders (0.75 MiB) remain,
+            # short of the 1.06 MiB needed for the target.
+            self._write(storage, root, "u-20")
+            stats = storage.get_eviction_stats()
+            self.assertEqual(stats["passes"]["count"], 2)
+            self.assertEqual(stats["passes"]["reached_target"], 1)
+            self.assertEqual(stats["passes"]["under_budget_short_of_target"], 1)
+            self.assertEqual(stats["passes"]["over_budget"], 0)
+            self.assertEqual(stats["passes"]["futile"], 0)
+            self.assertEqual(storage._available_size, 3 * self.FOLDER_BYTES - self.WRITE_BYTES)
+            self.assertEqual(storage._futile_eviction_until, 0.0,
+                             "under budget is not futile: no cooldown")
+            self.assertEqual(stats["evictions"]["folders"], 8)
+            # Pending at pass 2: the 20 files already in the incoming folder.
+            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB - 20 * self.WRITE_BYTES)
+            self.assertEqual(stats["headroom"]["max_bytes"], 2 * self.MiB)
+
+            # Pass 3: 11 fast writes bring available back to 0, write #33 is
+            # over budget with nothing left to evict.
+            for i in range(21, 33):
+                self._write(storage, root, f"u-{i}")
+            stats = storage.get_eviction_stats()
+            self.assertEqual(stats["passes"]["count"], 3)
+            self.assertEqual(stats["passes"]["over_budget"], 1)
+            self.assertEqual(stats["passes"]["futile"], 1)
+            self.assertLess(storage._available_size, 0)
+            self.assertGreater(storage._futile_eviction_until, time.monotonic(),
+                               "over budget with nothing freed arms the cooldown")
+            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB - 32 * self.WRITE_BYTES)
+            self.assertEqual(stats["writes"]["count"], 33)
+            self.assertEqual(stats["writes"]["bytes"], 33 * self.WRITE_BYTES)
+            self.assertEqual(stats["writes"]["avg_bytes"], self.WRITE_BYTES)
+
+    def test_reset_starts_a_new_observation_window(self):
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._full_cache(root, over_eviction_mb=1)
+            self._write(storage, root, "u-0")
+            self.assertEqual(storage.get_eviction_stats()["passes"]["count"], 1)
+
+            fresh = storage.reset_eviction_stats()
+
+            self.assertEqual(fresh["passes"]["count"], 0)
+            self.assertEqual(fresh["writes"]["count"], 0)
+            self.assertEqual(fresh["du"]["count"], 0)
+            self.assertIsNone(fresh["headroom"]["min_bytes"])
+            # The configuration is not part of the window.
+            self.assertEqual(fresh["config"]["over_eviction_bytes"], self.MiB)
+            self.assertEqual(fresh["config"]["max_bytes"], 2 * self.MiB)
+
+    def test_headroom_larger_than_the_budget_is_clamped_and_negative_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._storage(root, max_size_mb=1, over_eviction_mb=5)
+            self.assertEqual(storage._over_eviction_bytes, self.MiB)
+
+            with self.assertRaises(ValueError):
+                self._storage(root, max_size_mb=1, over_eviction_mb=-1)
+
+    def test_budget_can_be_changed_at_runtime(self):
+        # PUT /s3-zip/local-cache/budget: the e2e tests shrink the budget for
+        # one scenario. No rescan: available moves by the difference.
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._full_cache(root, over_eviction_mb=1)
+            self.assertEqual(storage._available_size, 0)
+
+            budget = storage.set_budget(max_size_mb=4)
+            self.assertEqual(budget["LocalStorageMaxSizeMB"], 4)
+            self.assertEqual(budget["OverEvictionMB"], 1)
+            self.assertEqual(storage._available_size, 2 * self.MiB)
+            self._write(storage, root, "u-0")
+            self.assertEqual(storage.get_eviction_stats()["writes"]["fast_path"], 1,
+                             "a bigger budget makes room without a pass")
+
+            # Shrinking below the occupancy: the next write runs a pass; the
+            # eight uploaded folders (2 MiB) are not enough to reach the
+            # 1 MiB target (needs 2.125 MiB), so it lands under budget but
+            # short of the target -- and does NOT arm the futile cooldown.
+            storage._futile_eviction_until = time.monotonic() + 3600
+            budget = storage.set_budget(max_size_mb=1)
+            self.assertEqual(storage._futile_eviction_until, 0.0,
+                             "a budget change must let the next write rescan")
+            self.assertEqual(storage._available_size, -self.MiB - self.WRITE_BYTES)
+            self._write(storage, root, "u-1")
+            self.assertEqual(storage._available_size, self.MiB - 2 * self.WRITE_BYTES)
+            stats = storage.get_eviction_stats()
+            self.assertEqual(stats["passes"]["under_budget_short_of_target"], 1)
+            self.assertEqual(stats["evictions"]["folders"], 8)
+
+            # A headroom larger than the (new) budget is clamped, and a
+            # budget shrinking under an existing headroom clamps it too.
+            self.assertEqual(storage.set_budget(over_eviction_mb=5)["OverEvictionMB"], 1)
+            self.assertEqual(storage.set_budget(max_size_mb=4, over_eviction_mb=3)["OverEvictionMB"], 3)
+            self.assertEqual(storage.set_budget(max_size_mb=2)["OverEvictionMB"], 2)
+            self.assertEqual(storage.get_budget()["max_bytes"], 2 * self.MiB)
+
+            with self.assertRaises(ValueError):
+                storage.set_budget(max_size_mb=-1)
+
+    def test_zero_headroom_keeps_the_previous_behaviour(self):
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._full_cache(root, over_eviction_mb=0)
+            self._write(storage, root, "u-0")
+            # One folder is enough for the write to fit; nothing more goes.
+            self.assertEqual(storage._available_size, self.FOLDER_BYTES - self.WRITE_BYTES)
+            self.assertEqual(len([n for n in os.listdir(root) if n.startswith("series-")]), 7)
+            stats = storage.get_eviction_stats()
+            self.assertEqual(stats["passes"]["reached_target"], 1)
+            self.assertEqual(stats["config"]["effective_threshold_bytes"], 2 * self.MiB)
+
+
+class _FakeRestOutput:
+    """Stand-in for the ``output`` object Orthanc hands to a REST callback."""
+
+    def __init__(self):
+        self.status = None
+        self.body = None
+        self.mime = None
+        self.allowed = None
+
+    def AnswerBuffer(self, body, mime):
+        self.status = 200
+        self.body = body
+        self.mime = mime
+
+    def SendHttpStatusCode(self, status):
+        self.status = status
+
+    def SendHttpStatus(self, status, body):
+        self.status = status
+        self.body = body
+
+    def SendMethodNotAllowed(self, allowed):
+        self.status = 405
+        self.allowed = allowed
+
+
+class LocalCacheRestEndpointTests(unittest.TestCase):
+    """The REST routes of QM-10227, driven through the plugin module's handlers
+    with a real ``LocalStorage`` behind a bare ``S3ZipStorage``.
+
+    ``/s3-zip/local-cache/eviction-stats`` (GET), ``.../eviction-stats/reset``
+    (POST) and ``.../budget`` (GET, PUT). The e2e tests use them to put a cache
+    under pressure; the health page shows the first one.
+    """
+
+    MiB = 1024 * 1024
+
+    def setUp(self):
+        import s3_zip_storage_plugin as plugin_module
+        self.plugin = plugin_module
+        self._saved_singleton = plugin_module.storage_singleton
+        self.root_dir = tempfile.TemporaryDirectory()
+        with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_walk(self.root_dir.name)):
+            local_storage = LocalStorage(root=self.root_dir.name, max_size_mb=2, over_eviction_mb=1)
+        storage = S3ZipStorage.__new__(S3ZipStorage)
+        storage._local_storage = local_storage
+        plugin_module.storage_singleton = storage
+        self.storage = storage
+
+    def tearDown(self):
+        self.plugin.storage_singleton = self._saved_singleton
+        self.root_dir.cleanup()
+
+    def _call(self, handler, method, body=None):
+        out = _FakeRestOutput()
+        request = {"method": method, "groups": []}
+        if body is not None:
+            request["body"] = body
+        handler(out, "/ignored", **request)
+        return out
+
+    def _budget(self):
+        return json.loads(self._call(self.plugin.on_rest_api_local_cache_budget, "GET").body)
+
+    def test_eviction_stats_get_and_reset(self):
+        out = self._call(self.plugin.on_rest_api_local_cache_eviction_stats, "GET")
+        self.assertEqual(out.status, 200)
+        self.assertEqual(out.mime, "application/json")
+        stats = json.loads(out.body)
+        self.assertEqual(stats["config"]["max_bytes"], 2 * self.MiB)
+        self.assertEqual(stats["config"]["over_eviction_bytes"], self.MiB)
+        self.assertEqual(stats["du"]["count"], 1, "the constructor's scan")
+        for group in ("writes", "passes", "evictions", "headroom", "admin_evictions"):
+            self.assertIn(group, stats)
+
+        out = self._call(self.plugin.on_rest_api_local_cache_eviction_stats_reset, "POST")
+        self.assertEqual(out.status, 200)
+        fresh = json.loads(out.body)
+        self.assertEqual(fresh["du"]["count"], 0)
+        self.assertEqual(fresh["config"]["over_eviction_bytes"], self.MiB, "the config survives a reset")
+
+        self.assertEqual(self._call(self.plugin.on_rest_api_local_cache_eviction_stats, "POST").status, 405)
+        self.assertEqual(self._call(self.plugin.on_rest_api_local_cache_eviction_stats_reset, "GET").status, 405)
+
+    def test_budget_get_and_put(self):
+        self.assertEqual(self._budget()["LocalStorageMaxSizeMB"], 2)
+        self.assertEqual(self._budget()["OverEvictionMB"], 1)
+
+        out = self._call(self.plugin.on_rest_api_local_cache_budget, "PUT",
+                         body=b'{"LocalStorageMaxSizeMB": 8, "OverEvictionMB": 3}')
+        self.assertEqual(out.status, 200)
+        applied = json.loads(out.body)
+        self.assertEqual(applied["LocalStorageMaxSizeMB"], 8)
+        self.assertEqual(applied["OverEvictionMB"], 3)
+        self.assertEqual(self.storage._local_storage._max_size, 8 * self.MiB)
+        self.assertEqual(self.storage._local_storage._over_eviction_bytes, 3 * self.MiB)
+
+        # Either key alone.
+        out = self._call(self.plugin.on_rest_api_local_cache_budget, "PUT", body=b'{"OverEvictionMB": 1}')
+        self.assertEqual(out.status, 200)
+        self.assertEqual(self._budget(), {**self._budget(), "LocalStorageMaxSizeMB": 8, "OverEvictionMB": 1})
+
+        # Bad input is refused with a 400 and a reason, and changes nothing.
+        for body in (b'{"Bogus": 1}', b'[1]', b'not json', b'{"LocalStorageMaxSizeMB": -1}',
+                     b'{"OverEvictionMB": "x"}'):
+            out = self._call(self.plugin.on_rest_api_local_cache_budget, "PUT", body=body)
+            self.assertEqual(out.status, 400, body)
+            self.assertIn("error", json.loads(out.body), body)
+        budget = self._budget()
+        self.assertEqual(budget["LocalStorageMaxSizeMB"], 8)
+        self.assertEqual(budget["OverEvictionMB"], 1)
+
+        self.assertEqual(self._call(self.plugin.on_rest_api_local_cache_budget, "POST").status, 405)
+
+    def test_endpoints_answer_503_before_the_plugin_is_initialized(self):
+        self.plugin.storage_singleton = None
+        for handler, method in (
+            (self.plugin.on_rest_api_local_cache_eviction_stats, "GET"),
+            (self.plugin.on_rest_api_local_cache_eviction_stats_reset, "POST"),
+            (self.plugin.on_rest_api_local_cache_budget, "GET"),
+            (self.plugin.on_rest_api_local_cache_budget, "PUT"),
+        ):
+            self.assertEqual(self._call(handler, method, body=b'{}').status, 503, handler.__name__)
+
+
 class ConcurrentStressTests(unittest.TestCase):
     """Best-effort multi-thread stress.
 
