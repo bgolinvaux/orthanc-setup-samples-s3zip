@@ -58,6 +58,9 @@ class _EvictionCounters:
     write_bytes: int = 0
     fast_path_count: int = 0
     cooldown_admission_count: int = 0
+    # Writers that queued for the scan slot behind another writer's pass and
+    # found their room already made when they got it (no scan of their own).
+    admitted_after_another_pass_count: int = 0
     # Every `du` over the cache: startup, make-room passes, admin evictions
     # and stats snapshots.
     du_count: int = 0
@@ -729,6 +732,26 @@ class LocalStorage(LocalStorageInterface):
         try:
             self._pause_writes_for_scan()
             scan_paused = True
+
+            # Writers that cross the budget together queue on the scan slot.
+            # The first one's pass refreshes the occupancy with every waiting
+            # reservation already counted, then evicts until the headroom is
+            # free, so by the time the next one gets the slot the room it
+            # reserved is there. Re-running the `du` and the pass for it would
+            # stall every writer once more, for nothing: with N concurrent
+            # writers (a PACS with several associations, a parallel upload)
+            # that was N full-cache scans per budget crossing instead of one.
+            with self._lock:
+                if self._available_size >= 0:
+                    self._counters.admitted_after_another_pass_count += 1
+                    logger.debug(
+                        "LocalStorage: room already made by a concurrent pass; skipping the scan",
+                        reservation_bytes=reservation_size,
+                        available_bytes=self._available_size,
+                        reserved_bytes=self._reserved_bytes,
+                    )
+                    return reservation_size
+
             self._update_local_storage_stats_with_writes_paused()
 
             logger.debug(
@@ -992,6 +1015,7 @@ class LocalStorage(LocalStorageInterface):
                     "avg_bytes": round(_avg(c.write_bytes, c.write_count)),
                     "fast_path": c.fast_path_count,
                     "admitted_during_cooldown": c.cooldown_admission_count,
+                    "admitted_after_another_pass": c.admitted_after_another_pass_count,
                     "slow_path": c.pass_count,
                 },
                 "du": {

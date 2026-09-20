@@ -792,6 +792,92 @@ class OverEvictionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 storage.set_budget(max_size_mb=-1)
 
+    def test_a_writer_queued_behind_another_pass_does_not_scan_again(self):
+        # Deterministic version: by the time this writer gets the scan slot, a
+        # concurrent pass has refreshed the occupancy (this writer's
+        # reservation included) and freed the headroom. It must not pay for a
+        # du of its own.
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._full_cache(root, over_eviction_mb=1)
+            real_pause = storage._pause_writes_for_scan
+
+            def pause_then_find_the_room_made():
+                real_pause()
+                with storage._lock:
+                    storage._available_size = self.MiB
+
+            with mock.patch.object(storage, "_pause_writes_for_scan",
+                                   side_effect=pause_then_find_the_room_made):
+                with mock.patch("local_storage.subprocess.run", side_effect=_fake_du_walk(root)):
+                    reserved = storage._make_room(self.WRITE_BYTES)
+            storage._commit_write_reservation(reserved)
+
+            stats = storage.get_eviction_stats()
+            self.assertEqual(stats["du"]["count"], 1, "only the constructor's scan")
+            self.assertEqual(stats["passes"]["count"], 0)
+            self.assertEqual(stats["writes"]["admitted_after_another_pass"], 1)
+            self.assertEqual(stats["writes"]["count"], 1)
+            self.assertFalse(storage._scan_in_progress, "the scan slot must be released")
+            self.assertEqual(storage._reserved_bytes, 0)
+            self.assertEqual(storage._available_size, self.MiB)
+
+    def test_concurrent_writers_share_one_pass(self):
+        # The real interleaving: writer A is inside its du when writer B
+        # crosses the budget. B queues on the scan slot; A's pass counts B's
+        # reservation and frees the headroom; B gets the slot and finds its
+        # room made. One du, one pass, two writes.
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._full_cache(root, over_eviction_mb=1)
+            real_du = _fake_du_walk(root)
+            du_calls = []
+            du_started = threading.Event()
+            release_du = threading.Event()
+
+            def slow_du(cmd, **kwargs):
+                du_calls.append(1)
+                du_started.set()
+                self.assertTrue(release_du.wait(timeout=5))
+                return real_du(cmd, **kwargs)
+
+            reserved = {}
+
+            def writer(name):
+                reserved[name] = storage._make_room(self.WRITE_BYTES)
+
+            with mock.patch("local_storage.subprocess.run", side_effect=slow_du):
+                a = threading.Thread(target=writer, args=("a",))
+                a.start()
+                self.assertTrue(du_started.wait(timeout=5))
+                b = threading.Thread(target=writer, args=("b",))
+                b.start()
+                # B has reserved (and is heading for the scan slot) once both
+                # reservations are on the books; only then let A's du return.
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    with storage._lock:
+                        if storage._reserved_bytes == 2 * self.WRITE_BYTES:
+                            break
+                    time.sleep(0.005)
+                else:
+                    self.fail("writer B never reserved")
+                release_du.set()
+                a.join(timeout=5)
+                b.join(timeout=5)
+            self.assertFalse(a.is_alive() or b.is_alive())
+            for name in ("a", "b"):
+                storage._commit_write_reservation(reserved[name])
+
+            stats = storage.get_eviction_stats()
+            self.assertEqual(len(du_calls), 1, "B must not run a du of its own")
+            self.assertEqual(stats["passes"]["count"], 1)
+            self.assertEqual(stats["writes"]["admitted_after_another_pass"], 1)
+            self.assertEqual(stats["writes"]["count"], 2)
+            # A's pass counted both reservations: 2 MiB - 128 KiB needs five
+            # folders to reach 1 MiB free, leaving 1.125 MiB.
+            self.assertEqual(storage._available_size, 5 * self.FOLDER_BYTES - 2 * self.WRITE_BYTES)
+            self.assertFalse(storage._scan_in_progress)
+            self.assertEqual(storage._reserved_bytes, 0)
+
     def test_zero_headroom_keeps_the_previous_behaviour(self):
         with tempfile.TemporaryDirectory() as root:
             storage = self._full_cache(root, over_eviction_mb=0)
