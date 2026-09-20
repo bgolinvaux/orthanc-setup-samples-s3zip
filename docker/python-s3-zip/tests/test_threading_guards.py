@@ -645,11 +645,12 @@ class OverEvictionTests(unittest.TestCase):
             self.assertEqual(stats["writes"]["count"], 1)
             self.assertEqual(stats["writes"]["bytes"], self.WRITE_BYTES)
             self.assertEqual(stats["writes"]["slow_path"], 1)
-            # Nothing was pending when the pass ran (the incoming folder is
-            # created by the write, after make_room), so the whole budget was
-            # reachable.
-            self.assertEqual(stats["headroom"]["max_bytes"], 2 * self.MiB)
-            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB)
+            # Nothing was on disk in the incoming folder when the pass ran
+            # (the write creates it after make_room), but the write's own
+            # reservation was on the books: the best a pass can reach is the
+            # budget minus what the waiting writers are about to land.
+            self.assertEqual(stats["headroom"]["max_bytes"], 2 * self.MiB - self.WRITE_BYTES)
+            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB - self.WRITE_BYTES)
 
     def test_headroom_spaces_out_the_scans(self):
         # Same workload, 16 writes of 64 KiB into a full cache. Without a
@@ -685,7 +686,8 @@ class OverEvictionTests(unittest.TestCase):
         #   3. over budget with nothing evictable: the futile cooldown, as
         #      before this change.
         # The headroom measured at each pass is the budget minus what the
-        # incoming (pending) folder holds at that moment.
+        # incoming (pending) folder holds at that moment, minus the
+        # reservation of the write that triggered the pass.
         with tempfile.TemporaryDirectory() as root:
             storage = self._full_cache(root, over_eviction_mb=1)
 
@@ -708,9 +710,10 @@ class OverEvictionTests(unittest.TestCase):
             self.assertEqual(storage._futile_eviction_until, 0.0,
                              "under budget is not futile: no cooldown")
             self.assertEqual(stats["evictions"]["folders"], 8)
-            # Pending at pass 2: the 20 files already in the incoming folder.
-            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB - 20 * self.WRITE_BYTES)
-            self.assertEqual(stats["headroom"]["max_bytes"], 2 * self.MiB)
+            # Pending at pass 2: the 20 files already in the incoming folder,
+            # plus the reservation of write #21 itself.
+            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB - 21 * self.WRITE_BYTES)
+            self.assertEqual(stats["headroom"]["max_bytes"], 2 * self.MiB - self.WRITE_BYTES)
 
             # Pass 3: 11 fast writes bring available back to 0, write #33 is
             # over budget with nothing left to evict.
@@ -723,7 +726,8 @@ class OverEvictionTests(unittest.TestCase):
             self.assertLess(storage._available_size, 0)
             self.assertGreater(storage._futile_eviction_until, time.monotonic(),
                                "over budget with nothing freed arms the cooldown")
-            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB - 32 * self.WRITE_BYTES)
+            # 32 files in the incoming folder plus write #33's reservation.
+            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB - 33 * self.WRITE_BYTES)
             self.assertEqual(stats["writes"]["count"], 33)
             self.assertEqual(stats["writes"]["bytes"], 33 * self.WRITE_BYTES)
             self.assertEqual(stats["writes"]["avg_bytes"], self.WRITE_BYTES)
@@ -791,6 +795,26 @@ class OverEvictionTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 storage.set_budget(max_size_mb=-1)
+
+    def test_a_rejected_budget_change_leaves_the_budget_untouched(self):
+        # Both keys in one request, the second one invalid: the first must
+        # not have been applied by the time the REST handler answers 400,
+        # and the futile cooldown must not have been cleared either.
+        with tempfile.TemporaryDirectory() as root:
+            storage = self._full_cache(root, over_eviction_mb=1)
+            storage._futile_eviction_until = time.monotonic() + 3600
+            before = (storage._max_size, storage._over_eviction_bytes,
+                      storage._available_size, storage._futile_eviction_until)
+
+            with self.assertRaises(ValueError):
+                storage.set_budget(max_size_mb=8, over_eviction_mb=-1)
+
+            self.assertEqual(
+                (storage._max_size, storage._over_eviction_bytes,
+                 storage._available_size, storage._futile_eviction_until),
+                before,
+            )
+            self.assertEqual(storage.get_budget()["LocalStorageMaxSizeMB"], 2)
 
     def test_a_writer_queued_behind_another_pass_does_not_scan_again(self):
         # Deterministic version: by the time this writer gets the scan slot, a
@@ -875,6 +899,10 @@ class OverEvictionTests(unittest.TestCase):
             # A's pass counted both reservations: 2 MiB - 128 KiB needs five
             # folders to reach 1 MiB free, leaving 1.125 MiB.
             self.assertEqual(storage._available_size, 5 * self.FOLDER_BYTES - 2 * self.WRITE_BYTES)
+            # ... and so does the headroom: with nothing pending on disk, the
+            # best the pass could reach was the budget minus the 128 KiB the
+            # two waiting writers were about to land.
+            self.assertEqual(stats["headroom"]["min_bytes"], 2 * self.MiB - 2 * self.WRITE_BYTES)
             self.assertFalse(storage._scan_in_progress)
             self.assertEqual(storage._reserved_bytes, 0)
 
@@ -992,9 +1020,10 @@ class LocalCacheRestEndpointTests(unittest.TestCase):
         self.assertEqual(out.status, 200)
         self.assertEqual(self._budget(), {**self._budget(), "LocalStorageMaxSizeMB": 8, "OverEvictionMB": 1})
 
-        # Bad input is refused with a 400 and a reason, and changes nothing.
+        # Bad input is refused with a 400 and a reason, and changes nothing --
+        # including a valid first key next to an invalid second one.
         for body in (b'{"Bogus": 1}', b'[1]', b'not json', b'{"LocalStorageMaxSizeMB": -1}',
-                     b'{"OverEvictionMB": "x"}'):
+                     b'{"OverEvictionMB": "x"}', b'{"LocalStorageMaxSizeMB": 16, "OverEvictionMB": -1}'):
             out = self._call(self.plugin.on_rest_api_local_cache_budget, "PUT", body=body)
             self.assertEqual(out.status, 400, body)
             self.assertIn("error", json.loads(out.body), body)

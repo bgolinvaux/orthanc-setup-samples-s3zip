@@ -84,8 +84,9 @@ class _EvictionCounters:
     evicted_folders: int = 0
     evicted_bytes: int = 0
     evicted_bytes_max_in_pass: int = 0
-    # headroom = max_size - bytes the pass may not delete (pending + leased),
-    # measured at each pass: the best a pass could possibly reach.
+    # headroom = max_size - bytes the pass may not delete (pending + leased)
+    #          - bytes reserved by the writes waiting on the pass,
+    # measured at each pass: the best `available` a pass could possibly reach.
     headroom_min_bytes: Optional[int] = None
     headroom_max_bytes: Optional[int] = None
     admin_eviction_count: int = 0
@@ -229,24 +230,27 @@ class LocalStorage(LocalStorageInterface):
                      over_eviction_mb=over_eviction_mb,
                      over_eviction_bytes=self._over_eviction_bytes)
 
-    def _clamp_over_eviction_bytes(self, over_eviction_bytes: int) -> int:
-        """Validate an over-eviction headroom against the current budget.
+    def _clamp_over_eviction_bytes(self, over_eviction_bytes: int, max_size: Optional[int] = None) -> int:
+        """Validate an over-eviction headroom against a budget, the current one by default.
 
         Negative is a configuration error. Larger than the budget is legal --
         it means "every pass drains everything evictable" -- but the target
         `available >= headroom` could then never be met, which would make the
         pass statistics lie, so it is clamped to the budget with a warning.
+        ``set_budget`` passes the budget it is about to apply, so that a
+        request can be validated in full before anything changes.
         """
+        budget: int = self._max_size if max_size is None else max_size
         if over_eviction_bytes < 0:
             raise ValueError(f"OverEvictionMB must be >= 0, got {over_eviction_bytes} bytes")
-        if over_eviction_bytes > self._max_size:
+        if over_eviction_bytes > budget:
             logger.warning(
                 "LocalStorage: OverEvictionMB is larger than LocalStorageMaxSizeMB; "
                 "clamping it to the budget (every eviction pass will drain everything evictable)",
                 over_eviction_bytes=over_eviction_bytes,
-                max_size_bytes=self._max_size,
+                max_size_bytes=budget,
             )
-            return self._max_size
+            return budget
         return over_eviction_bytes
 
     def set_eviction_guard(self, is_folder_safe_to_evict: Callable[[str], bool]) -> None:
@@ -616,12 +620,12 @@ class LocalStorage(LocalStorageInterface):
         """Bytes in the folders an eviction pass may not delete right now.
 
         Leased folders plus the folders the eviction guard refuses (no
-        ``.s3-uploaded`` marker). ``max_size - protected`` is the headroom a
-        pass can reach at best: below the over-eviction target the pass cannot
-        meet its target whatever it deletes, and below zero the pending set
-        alone is over budget. One ``exists()`` per series folder, right after
-        a ``du`` that walked every one of them, so the dentries are warm.
-        Caller MUST hold ``self._lock``.
+        ``.s3-uploaded`` marker). ``max_size - protected - reserved`` is the
+        headroom a pass can reach at best (``_record_pass_locked``): below the
+        over-eviction target the pass cannot meet its target whatever it
+        deletes, and below zero the pending set alone is over budget. One
+        ``exists()`` per series folder, right after a ``du`` that walked every
+        one of them, so the dentries are warm. Caller MUST hold ``self._lock``.
         """
         protected: int = 0
         for _last_modified, path, folder_size in list(self._folder_stats.queue):
@@ -672,7 +676,12 @@ class LocalStorage(LocalStorageInterface):
         c.evicted_bytes += result.freed_bytes
         c.evicted_bytes_max_in_pass = max(c.evicted_bytes_max_in_pass, result.freed_bytes)
 
-        headroom: int = self._max_size - protected_bytes
+        # The best `available` this pass could have reached: everything
+        # evictable gone, leaving the protected folders and the bytes the
+        # writers waiting on the pass (the triggering one included) have
+        # reserved and are about to land. `available` itself is
+        # `max_size - on disk - reserved`, so the reservations count here too.
+        headroom: int = self._max_size - protected_bytes - self._reserved_bytes
         c.headroom_min_bytes = headroom if c.headroom_min_bytes is None else min(c.headroom_min_bytes, headroom)
         c.headroom_max_bytes = headroom if c.headroom_max_bytes is None else max(c.headroom_max_bytes, headroom)
 
@@ -1085,20 +1094,26 @@ class LocalStorage(LocalStorageInterface):
         budget and runs a pass. The futile-pass cooldown is cleared so that
         write does rescan rather than coast on a conclusion drawn under the
         old budget. The change lives in memory only: a restart goes back to
-        the configuration file.
+        the configuration file. Both inputs are validated before anything is
+        touched, so a rejected request (a 400 from the REST handler) leaves
+        the budget exactly as it was, even when only the second key is bad.
         """
         with self._lock:
+            new_max_size: int = self._max_size
             if max_size_mb is not None:
                 if max_size_mb < 0:
                     raise ValueError(f"LocalStorageMaxSizeMB must be >= 0, got {max_size_mb}")
-                new_max_size: int = max_size_mb * 1024 * 1024
-                self._available_size += new_max_size - self._max_size
-                self._max_size = new_max_size
-            if over_eviction_mb is not None:
-                self._over_eviction_bytes = self._clamp_over_eviction_bytes(over_eviction_mb * 1024 * 1024)
-            elif self._over_eviction_bytes > self._max_size:
-                # The budget shrank under a headroom set earlier.
-                self._over_eviction_bytes = self._clamp_over_eviction_bytes(self._over_eviction_bytes)
+                new_max_size = max_size_mb * 1024 * 1024
+            # Re-clamping the existing headroom against the new budget covers
+            # the budget shrinking under a headroom set earlier.
+            new_over_eviction_bytes: int = self._clamp_over_eviction_bytes(
+                over_eviction_mb * 1024 * 1024 if over_eviction_mb is not None else self._over_eviction_bytes,
+                max_size=new_max_size,
+            )
+
+            self._available_size += new_max_size - self._max_size
+            self._max_size = new_max_size
+            self._over_eviction_bytes = new_over_eviction_bytes
             self._futile_eviction_until = 0.0
 
             logger.info(
