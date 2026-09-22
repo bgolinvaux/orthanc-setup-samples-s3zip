@@ -25,6 +25,13 @@ logger.debug("s3_zip_storage_plugin module loaded")
 storage_singleton: Optional[S3ZipStorage] = None
 
 DEFAULT_MAX_LOCAL_STORAGE_SIZE_MB: float = 30720
+# QM-10227: how much of LocalStorageMaxSizeMB an eviction pass leaves free.
+# The pass evicts down to LocalStorageMaxSizeMB - OverEvictionMB instead of
+# stopping as soon as the triggering write fits, so that passes (each one a
+# full-cache `du` with every writer paused) run once per that many bytes of
+# ingest instead of once per write over the budget.
+# 0 = a pass stops as soon as the triggering write fits.
+DEFAULT_OVER_EVICTION_MB: int = 0
 
 def _storage_create(uuid: str,
                     content_type: orthanc.ContentType,
@@ -174,6 +181,85 @@ def on_rest_api_local_cache_stats(output, uri, **request):
         output.AnswerBuffer(json.dumps(stats), 'application/json')
     else:
         output.SendMethodNotAllowed('GET')
+
+
+def on_rest_api_local_cache_eviction_stats(output, uri, **request):
+    """GET /s3-zip/local-cache/eviction-stats -- counters of the make-room path (QM-10227).
+
+    Diagnostic endpoint: instance writes, `du` scans and their duration,
+    eviction passes and what each freed, where each landed relative to the
+    over-eviction target, the smallest headroom seen. Neither scans nor evicts.
+    """
+    global storage_singleton
+
+    if request['method'] == 'GET':
+        if not storage_singleton:
+            output.SendHttpStatusCode(503)
+            return
+        output.AnswerBuffer(json.dumps(storage_singleton.get_eviction_stats()), 'application/json')
+    else:
+        output.SendMethodNotAllowed('GET')
+
+
+def on_rest_api_local_cache_eviction_stats_reset(output, uri, **request):
+    """POST /s3-zip/local-cache/eviction-stats/reset -- start a new observation window.
+
+    Returns the freshly zeroed counters. Used by tests to scope their checks
+    to one scenario.
+    """
+    global storage_singleton
+
+    if request['method'] == 'POST':
+        if not storage_singleton:
+            output.SendHttpStatusCode(503)
+            return
+        output.AnswerBuffer(json.dumps(storage_singleton.reset_eviction_stats()), 'application/json')
+    else:
+        output.SendMethodNotAllowed('POST')
+
+
+def on_rest_api_local_cache_budget(output, uri, **request):
+    """GET/PUT /s3-zip/local-cache/budget -- the cache budget and headroom in force (QM-10227).
+
+    GET returns ``LocalStorageMaxSizeMB`` and ``OverEvictionMB`` as currently
+    applied (plus their byte values). PUT takes a JSON body with either or
+    both keys and applies them in memory, without a restart: the e2e tests
+    use it to shrink the budget for the duration of one scenario, and an
+    operator can use it to try a headroom before changing the deployment.
+    The change does not survive a restart. Nothing is evicted by the call
+    itself; a smaller budget takes effect on the next write.
+    """
+    global storage_singleton
+
+    if request['method'] == 'GET':
+        if not storage_singleton:
+            output.SendHttpStatusCode(503)
+            return
+        output.AnswerBuffer(json.dumps(storage_singleton.get_local_cache_budget()), 'application/json')
+    elif request['method'] == 'PUT':
+        if not storage_singleton:
+            output.SendHttpStatusCode(503)
+            return
+        try:
+            body = json.loads(request.get('body') or b'{}')
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+            unknown = set(body) - {"LocalStorageMaxSizeMB", "OverEvictionMB"}
+            if unknown:
+                raise ValueError(f"unknown keys: {sorted(unknown)}")
+            max_size_mb = body.get("LocalStorageMaxSizeMB")
+            over_eviction_mb = body.get("OverEvictionMB")
+            result = storage_singleton.set_local_cache_budget(
+                max_size_mb=int(max_size_mb) if max_size_mb is not None else None,
+                over_eviction_mb=int(over_eviction_mb) if over_eviction_mb is not None else None,
+            )
+        except (ValueError, TypeError) as e:
+            logger.warning("rejected local-cache budget change", error=str(e))
+            output.SendHttpStatus(400, json.dumps({"error": str(e)}).encode())
+            return
+        output.AnswerBuffer(json.dumps(result), 'application/json')
+    else:
+        output.SendMethodNotAllowed('GET,PUT')
 
 
 def on_rest_api_local_cache_evict_all(output, uri, **request):
@@ -329,6 +415,9 @@ def register_s3_zip_storage_plugin():
         max_local_storage_size_mb = int(s3_zip_config.get("LocalStorageMaxSizeMB"))
     else:
         max_local_storage_size_mb = DEFAULT_MAX_LOCAL_STORAGE_SIZE_MB
+    over_eviction_mb = int(s3_zip_config.get("OverEvictionMB", DEFAULT_OVER_EVICTION_MB))
+    if over_eviction_mb < 0:
+        raise RuntimeError(f"'S3Zip.OverEvictionMB' must be >= 0, got {over_eviction_mb}")
 
     s3_retrieval_max_attempts = int(
         s3_zip_config.get("S3RetrievalMaxAttempts", DEFAULT_S3_RETRIEVAL_MAX_ATTEMPTS)
@@ -371,6 +460,7 @@ def register_s3_zip_storage_plugin():
 
     storage_singleton = S3ZipStorage(temporary_folder_root=s3_temp_folder_root,
                                      temp_folder_max_size_mb=max_local_storage_size_mb,
+                                     temp_folder_over_eviction_mb=over_eviction_mb,
                                      s3_client=s3_client,
                                      bucket_name=bucket_name,
                                      enable_compression=enable_compression,
@@ -394,6 +484,9 @@ def register_s3_zip_storage_plugin():
 
     orthanc.RegisterRestCallback('/s3-zip/local-cache/stats', on_rest_api_local_cache_stats)
     orthanc.RegisterRestCallback('/s3-zip/local-cache/evict-all', on_rest_api_local_cache_evict_all)
+    orthanc.RegisterRestCallback('/s3-zip/local-cache/eviction-stats', on_rest_api_local_cache_eviction_stats)
+    orthanc.RegisterRestCallback('/s3-zip/local-cache/eviction-stats/reset', on_rest_api_local_cache_eviction_stats_reset)
+    orthanc.RegisterRestCallback('/s3-zip/local-cache/budget', on_rest_api_local_cache_budget)
     logger.debug("registering new REST Api routes - done")
 
 
@@ -401,6 +494,8 @@ def register_s3_zip_storage_plugin():
                 bucket=bucket_name,
                 region=s3_zip_config.get("Region"),
                 temp_folder=s3_temp_folder_root,
+                max_local_storage_size_mb=max_local_storage_size_mb,
+                over_eviction_mb=over_eviction_mb,
                 compression=enable_compression,
                 key_prefix=key_prefix or "<none>",
                 s3_retrieval_max_attempts=s3_retrieval_max_attempts,
@@ -411,6 +506,7 @@ def register_s3_zip_storage_plugin():
     # Failsafe: bypass logging framework entirely so this is always visible
     print(f"[s3zip] storage plugin registered | bucket={bucket_name} "
           f"region={s3_zip_config.get('Region')} temp_folder={s3_temp_folder_root} "
+          f"max_local_storage_size_mb={max_local_storage_size_mb} over_eviction_mb={over_eviction_mb} "
           f"compression={enable_compression} key_prefix={key_prefix or '<none>'} "
           f"copy_queue_lease_timeout_sec={copy_queue_lease_timeout_sec}", file=sys.stderr)
 

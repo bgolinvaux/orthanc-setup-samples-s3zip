@@ -59,6 +59,7 @@ services:
                         "VirtualAddressing": false,
                         "EnableCompression": false,
                         "LocalStorageMaxSizeMB": 3000,
+                        "OverEvictionMB": 300,
                         "PrefixKey": "orthanc-zips",
                         "S3HousekeeperIntervalSeconds": 5
                     },
